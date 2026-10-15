@@ -21,8 +21,10 @@ jmp_buf     g_returnEnv;
 std::string* g_reportSink = nullptr;
 u64         g_modBase = 0;
 u64         g_modSize = 0;
-bool        g_diagnosticsInstalled = false;
 
+#if !defined(_WIN32)
+// POSIX fatal-signal diagnostics. Windows SEH-based guest diagnostics are
+// part of the Phase 2 Windows guest-hosting shim (see ARCHITECTURE.md §9).
 void buildCrashReport(int sig, siginfo_t* info, void* /*ctx*/) {
     if (g_reportSink) {
         char buf[512];
@@ -44,6 +46,7 @@ void buildCrashReport(int sig, siginfo_t* info, void* /*ctx*/) {
     // Do not unwind through guest frames; exit with a distinctive code.
     std::_Exit(139);
 }
+#endif // !_WIN32
 
 } // namespace
 
@@ -52,6 +55,7 @@ void installCrashDiagnostics(std::string* reportSink, u64 moduleBase, u64 module
     g_modBase = moduleBase;
     g_modSize = moduleSize;
 
+#if !defined(_WIN32)
     struct sigaction sa{};
     sa.sa_sigaction = buildCrashReport;
     sa.sa_flags = SA_SIGINFO;
@@ -60,7 +64,7 @@ void installCrashDiagnostics(std::string* reportSink, u64 moduleBase, u64 module
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
     sigaction(SIGFPE,  &sa, nullptr);
-    g_diagnosticsInstalled = true;
+#endif
 }
 
 GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {

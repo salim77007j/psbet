@@ -27,7 +27,11 @@ jobs:
         working-directory: build
         run: |
           ./psbet run hello.elf
+          # Frame limit (124) is the designed, controlled exit for the demo.
           ./psbet run cube.elf --frames 90 --screenshot-dir shots --screenshot-interval 30
+          rc=$?
+          echo "psbet exit code: $rc"
+          test "$rc" -eq 124
 
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
