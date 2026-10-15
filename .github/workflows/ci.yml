@@ -28,8 +28,9 @@ jobs:
         run: |
           ./psbet run hello.elf
           # Frame limit (124) is the designed, controlled exit for the demo.
-          ./psbet run cube.elf --frames 90 --screenshot-dir shots --screenshot-interval 30
-          rc=$?
+          # bash -e would abort on it, so capture the code defensively.
+          rc=0
+          ./psbet run cube.elf --frames 90 --screenshot-dir shots --screenshot-interval 30 || rc=$?
           echo "psbet exit code: $rc"
           test "$rc" -eq 124
 
