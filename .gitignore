@@ -1,0 +1,28 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Compiled artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.elf
+
+# Runtime output
+shots/
+screenshots-local/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Do NOT ignore docs/screenshots (committed evidence of validation runs)
+!docs/screenshots/
+!docs/screenshots/*.png

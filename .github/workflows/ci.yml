@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux build + tests + demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build (strict warnings = errors)
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        working-directory: build
+        run: ./psbet_tests
+
+      - name: Run cube demo (headless software GPU) + capture screenshots
+        working-directory: build
+        run: |
+          ./psbet run hello.elf
+          ./psbet run cube.elf --frames 90 --screenshot-dir shots --screenshot-interval 30
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-linux-x64
+          path: |
+            build/psbet
+            build/hello.elf
+            build/cube.elf
+
+      - name: Upload demo screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-demo-screenshots
+          path: build/shots/*.png
+
+  linux-asan:
+    name: Linux ASan/UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (sanitizers)
+        run: >
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+
+      - name: Tests under ASan/UBSan (guests stay non-instrumented)
+        working-directory: build-asan
+        run: ./psbet_tests
+
+  windows:
+    name: Windows build + core tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Phase 1: guest ELF execution is Linux-only (documented in the report);
+      # the Windows job validates the portable core (memory, PNG, rasterizer,
+      # command executor). Guest pipeline tests are compiled out on WIN32.
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-windows-x64
+          path: |
+            build/Release/psbet.exe
+            build/Release/psbet_tests.exe
