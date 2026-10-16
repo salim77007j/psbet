@@ -72,9 +72,12 @@ jobs:
           echo "=== reference shader (glslang) with best guess dcfg=4:"
           timeout 30 ./vk_bisect 0 4 2>&1 | tail -1 || echo "dcfg4-ref: SEGFAULT"
 
-      - name: Backtrace of one depth-attach crash
+      - name: Pipeline-shape probes (all on depth renderpass)
         working-directory: ci
         run: |
           set +e
-          g++ -std=c++17 -w -g -rdynamic -I../src vk_bisect.cpp -o vk_bisect_dbg -ldl -lpthread
-          timeout 30 ./vk_bisect_dbg 9 0 2>&1 | grep -E "FATAL|vk_bisect|lvp" | head -12
+          for pv in 0 1 2 3 4 5; do
+            out=$(timeout 30 ./vk_bisect 9 0 p $pv 2>&1); ec=$?
+            if [ $ec -eq 139 ]; then echo "probe $pv : SEGFAULT"
+            else echo "$out" | tail -1; fi
+          done

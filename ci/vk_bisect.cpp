@@ -251,6 +251,36 @@ int main(int argc, char** argv) {
     pi.renderPass = rp;
     pi.subpass = 0;
 
+    // Probe mode: argv[3]=="p" varies pipeline-shape hypotheses that all use
+    // the depth renderpass (rp 0) and the passthrough shader.
+    const char* probe = argc > 3 ? argv[3] : nullptr;
+    if (probe && probe[0] == 'p') {
+        const int pv = argc > 4 ? std::atoi(argv[4]) : 0;
+        switch (pv) {
+            case 0: pi.pDepthStencilState = nullptr; break;             // no DS state at all
+            case 1: rpi.dependencyCount = 0; break;                     // zero dependencies (renderpass rebuilt below)
+            case 2: pi.pColorBlendState = nullptr; break;               // no blend state
+            case 3: pi.pVertexInputState = nullptr; break;              // no vertex input
+            case 4: pi.pMultisampleState = nullptr; break;              // no multisample
+            case 5: dyn.dynamicStateCount = 0; dyn.pDynamicStates = nullptr; break; // no dynamic state
+            default: break;
+        }
+        if (pv == 1) {
+            // rebuild renderpass with zero deps
+            VkRenderPassCreateInfo rpi2 = rpi;
+            rpi2.dependencyCount = 0;
+            rpi2.pDependencies = nullptr;
+            VkRenderPass rp2;
+            if (CRP(dev, &rpi2, nullptr, &rp2) != VK_SUCCESS) { std::printf("probe rp fail\n"); return 1; }
+            pi.renderPass = rp2;
+        }
+        VkPipeline pipe = VK_NULL_HANDLE;
+        const VkResult r = CGP(dev, nullptr, 1, &pi, nullptr, &pipe);
+        std::printf("probe %d -> VkResult %d %s\n", pv, (int)r,
+                    r == VK_SUCCESS ? "OK" : "FAIL");
+        return r == VK_SUCCESS ? 0 : 1;
+    }
+
     VkPipeline pipe = VK_NULL_HANDLE;
     const VkResult r = CGP(dev, nullptr, 1, &pi, nullptr, &pipe);
     std::printf("combo %d dcfg=%d (vs=%s rp=%s dyn=%d) -> VkResult %d %s\n", combo, dCfg,
