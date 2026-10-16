@@ -69,9 +69,11 @@ if(NOT MSVC AND NOT WIN32)
   # flags — ASan-instrumented guest code has no runtime to link against and
   # will crash the moment it executes. Force-clean compile and link.
   set(GUEST_CFLAGS -shared -fPIC -nostartfiles -O2
-      -fno-sanitize=address -fno-sanitize=undefined)
+      -fno-sanitize=address -fno-sanitize=undefined
+      -fno-stack-protector)
   set(GUEST_LDFLAGS -shared -nostartfiles -Wl,-e,psb_entry -Wl,--build-id=none
-      -fno-sanitize=address -fno-sanitize=undefined)
+      -fno-sanitize=address -fno-sanitize=undefined
+      -fno-stack-protector)
 
   add_library(hb_hello SHARED tests/homebrew/hello.c)
   target_include_directories(hb_hello PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

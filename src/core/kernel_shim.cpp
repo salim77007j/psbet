@@ -636,6 +636,14 @@ void psbCxaFinalize(void* /*d*/) {
     // Guest images built with -nostartfiles may reference this; no-op.
 }
 
+// GCC's stack protector emits calls to __stack_chk_fail in guest images
+// built without -fno-stack-protector. Provide a host-side implementation so
+// such images still load; a triggered check means guest-stack corruption.
+void psbStackChkFail(void) {
+    LOG_ERROR("kernel: guest stack smashing detected (__stack_chk_fail)");
+    std::quick_exit(139);
+}
+
 int32_t psbGetRuntimeVersion(void) {
     return static_cast<int32_t>((kVersionMajor << 16) | (kVersionMinor << 8)
                               | kVersionPatch);
@@ -684,6 +692,7 @@ const Export kExports[] = {
     {"sceKernelOpen",                 (void*)&sceKernelOpen},
     {"sceKernelClose",                (void*)&sceKernelClose},
     {"sceKernelIsNeoMode",            (void*)&sceKernelIsNeoMode},
+    {"__stack_chk_fail",              (void*)&psbStackChkFail},
     {"__tls_get_addr",                (void*)&psbTlsGetAddr},
     {"__cxa_finalize",                (void*)&psbCxaFinalize},
     {"psbGetRuntimeVersion",          (void*)&psbGetRuntimeVersion},

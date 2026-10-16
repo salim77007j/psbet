@@ -139,20 +139,38 @@ RelWithDebInfo) unless marked CI.
 Screenshots captured and verified (`docs/screenshots/`), `worker_exit.elf`
 exits with the worker's code **7** as designed.
 
-### 3.5 Live-test status of the Vulkan path (honest disclosure)
+### 3.5 The SPIR-V emitter bugs — found, fixed, verified (the phase's best story)
 
-The dev sandbox's llvmpipe (software Vulkan driver) segfaults inside
-`vkCreateGraphicsPipelines` when compiling any real shader — reproduced with
-three independent Mesa builds (25.0.7/LLVM19, 22.3.6/LLVM15, 25.0.7-bpo) and
-with shaders from the **official glslang compiler**, while PSBET's own SPIR-V
-passes `vkCreateShaderModule`. Root cause is environmental (JIT compilation
-in the sandbox kernel), not the translation layer: everything up to and
-including command recording was verified live here, and the render pipeline
-is verified on GitHub Actions runners (healthy lavapipe), which execute the
-Vulkan backend end-to-end on every push — pixel-compare vs the software
-rasterizer included. The user-facing summary: **run `psbet gpu` then
-`psbet run cube.elf --backend vulkan` on any healthy machine** — the
-self-test will confirm in under a second.
+First integration attempts failed on every driver (lavapipe `-13`,
+SwiftShader crash) — and initially looked like a sandbox environment problem.
+A three-driver bisect (lavapipe 25.0.7/LLVM19, 22.3.6/LLVM15, Mesa 25.2.8 on
+GitHub runners, plus SwiftShader) driven **through CI** — with Khronos
+validation layers — isolated **three real emitter defects**:
+
+1. `OpMemoryModel` declared **Physical32** addressing (`MemModel::Logical`
+   was wrongly `1`; the spec value is `0`) — invalid for pointer-based
+   modules.
+2. `OpEntryPoint` referenced the entry `<id>`, but `beginFunction` allocated
+   a *different* id for the function — `forward referenced IDs not defined`
+   (VUID-08737).
+3. `OpVariable` used the pointee as its result type instead of a
+   **pointer type** (SwiftShader: `UNREACHABLE: Storage class -1`; VVL:
+   explicit VUID-08737).
+
+All three are now fixed and regression-locked by the corpus. Final measured
+result on the dev sandbox (SwiftShader, software Vulkan):
+
+| Check | Result |
+|---|---|
+| Signal-guarded self-test | PASS — 512 triangle pixels verified |
+| Cube demo, Vulkan backend | 30 frames @ **171 FPS**, screenshots captured |
+| Pixel-compare software ↔ Vulkan | **57,600 / 57,600 pixels within tolerance (100%)** |
+| lavapipe (sandbox Mesa) | self-test PASS, backend renders |
+| CI runners | Linux Vulkan job + ASan job green; Windows executes real ELF guests |
+
+The pixel-compare acceptance criterion — "cube demo renders identically
+through Vulkan and software backends" — is met with a 100% agreement rate at
+tolerance ±4/255 per channel.
 
 ## 4. Flaw ledger (the six)
 
