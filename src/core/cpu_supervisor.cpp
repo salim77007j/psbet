@@ -65,17 +65,35 @@ void buildCrashReport(int sig, siginfo_t* info, void* /*ctx*/) {
 // the guest module get the same report + terminate flow as SIGSEGV on Linux.
 long CALLBACK guestVectoredHandler(PEXCEPTION_POINTERS ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    const u64 faultPc = reinterpret_cast<u64>(ep->ExceptionRecord->ExceptionAddress);
+    const char* name = "unknown";
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:    name = "ACCESS_VIOLATION"; break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION: name = "ILLEGAL_INSTRUCTION"; break;
+        case EXCEPTION_PRIV_INSTRUCTION:    name = "PRIV_INSTRUCTION"; break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:  name = "INT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_STACK_OVERFLOW:      name = "STACK_OVERFLOW"; break;
+        case 0xC0000409:                    name = "STACK_BUFFER_OVERRUN"; break;
+        case 0xC0000602:                    name = "FAIL_FAST_EXCEPTION"; break;
+        default: break;
+    }
+    LOG_ERROR("CPU: Windows exception %s (0x%08lx) at host 0x%llx (module offset 0x%llx)",
+              name, static_cast<unsigned long>(code),
+              static_cast<unsigned long long>(faultPc),
+              static_cast<unsigned long long>(faultPc - g_modBase));
     const bool fatal =
         code == EXCEPTION_ACCESS_VIOLATION ||
         code == EXCEPTION_ILLEGAL_INSTRUCTION ||
         code == EXCEPTION_PRIV_INSTRUCTION ||
         code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
-        code == EXCEPTION_STACK_OVERFLOW;
+        code == EXCEPTION_STACK_OVERFLOW ||
+        code == 0xC0000409 || code == 0xC0000602;
     if (!fatal) return EXCEPTION_CONTINUE_SEARCH;
-    const u64 addr = reinterpret_cast<u64>(
-        ep->ExceptionRecord->ExceptionInformation[1] != 0
-            ? (void*)ep->ExceptionRecord->ExceptionInformation[1]
-            : ep->ExceptionRecord->ExceptionAddress);
+    u64 addr = faultPc;
+    if (code == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[1] != 0)
+        addr = ep->ExceptionRecord->ExceptionInformation[1];
     buildReport(addr);
     return EXCEPTION_CONTINUE_SEARCH; // not reached (buildReport exits)
 }
