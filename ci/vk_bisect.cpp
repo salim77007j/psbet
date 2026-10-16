@@ -102,6 +102,11 @@ int main(int argc, char** argv) {
     VkShaderModule fs = VK_NULL_HANDLE;
     if (CSM(dev, &fci, nullptr, &fs) != VK_SUCCESS) { std::printf("fs module rejected\n"); return 0; }
 
+    // Depth-config axis (argv[2], only meaningful when withDepth):
+    //   0 = D32 + DONT_CARE store (current)   1 = D32 + STORE
+    //   2 = D24_UNORM_S8_UINT + DONT_CARE     3 = D32_S8_UINT + DONT_CARE
+    //   4 = D32 + full depth-aware deps       5 = D32 + initialLayout DEPTH_OPT
+    const int dCfg = argc > 2 ? std::atoi(argv[2]) : 0;
     const bool withDepth = rpIdx < 2;
     VkAttachmentDescription att[2]{};
     att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -115,7 +120,18 @@ int main(int argc, char** argv) {
                                     : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     att[1] = att[0];
     att[1].format = VK_FORMAT_D32_SFLOAT;
-    att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    switch (dCfg) {
+        case 2: att[1].format = VK_FORMAT_D24_UNORM_S8_UINT; break;
+        case 3: att[1].format = VK_FORMAT_D32_SFLOAT_S8_UINT; break;
+        default: break;
+    }
+    att[1].storeOp = (dCfg == 1) ? VK_ATTACHMENT_STORE_OP_STORE
+                                 : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = (dCfg == 5)
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        : VK_IMAGE_LAYOUT_UNDEFINED;
     att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -129,9 +145,19 @@ int main(int argc, char** argv) {
     VkSubpassDependency deps[2]{};
     deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass = 0;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (withDepth && dCfg == 4) {
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                             | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                             | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstStageMask = deps[0].srcStageMask;
+        deps[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                              | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[0].dstAccessMask = deps[0].srcAccessMask;
+    } else {
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     deps[1].srcStageMask = withDepth ? (VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
@@ -227,7 +253,7 @@ int main(int argc, char** argv) {
 
     VkPipeline pipe = VK_NULL_HANDLE;
     const VkResult r = CGP(dev, nullptr, 1, &pi, nullptr, &pipe);
-    std::printf("combo %d (vs=%s rp=%s dyn=%d) -> VkResult %d %s\n", combo,
+    std::printf("combo %d dcfg=%d (vs=%s rp=%s dyn=%d) -> VkResult %d %s\n", combo, dCfg,
                 vsPaths[vIdx] ? vsPaths[vIdx] : "garbage",
                 rpIdx == 0 ? "DEPTH+TS" : rpIdx == 1 ? "DEPTH+CA" : "COLORONLY",
                 dynIdx, (int)r, r == VK_SUCCESS ? "OK" : "FAIL");

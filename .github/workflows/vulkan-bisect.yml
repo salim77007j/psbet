@@ -59,10 +59,22 @@ jobs:
             done
           done
 
-      - name: Probe with mesa debug env
+      - name: Depth-configuration matrix (psbet shader, depth+TS, dynamic)
         working-directory: ci
         run: |
           set +e
-          MESA_DEBUG=1 LP_NUM_THREADS=1 ./vk_bisect 0 2>&1 | tail -5
-          echo "---- combo 9 (psbet passthrough, depth+TS, static) with MESA_DEBUG:"
-          MESA_DEBUG=1 LP_NUM_THREADS=1 ./vk_bisect 9 2>&1 | tail -5
+          for dc in 0 1 2 3 4 5; do
+            out=$(timeout 30 ./vk_bisect 9 $dc 2>&1); ec=$?
+            if [ $ec -eq 139 ]; then echo "dcfg $dc : SEGFAULT"
+            elif [ $ec -eq 124 ]; then echo "dcfg $dc : TIMEOUT"
+            else echo "$out" | tail -1; fi
+          done
+          echo "=== reference shader (glslang) with best guess dcfg=4:"
+          timeout 30 ./vk_bisect 0 4 2>&1 | tail -1 || echo "dcfg4-ref: SEGFAULT"
+
+      - name: Backtrace of one depth-attach crash
+        working-directory: ci
+        run: |
+          set +e
+          g++ -std=c++17 -w -g -rdynamic -I../src vk_bisect.cpp -o vk_bisect_dbg -ldl -lpthread
+          timeout 30 ./vk_bisect_dbg 9 0 2>&1 | grep -E "FATAL|vk_bisect|lvp" | head -12
