@@ -55,6 +55,8 @@ EXTERN psbXGetRuntimeName:PROC
 EXTERN psbXGnmSubmitCommandBuffers:PROC
 EXTERN psbXStackChkFail:PROC
 
+_TEXT SEGMENT
+
 ; --- arity 0 -----------------------------------------------------------------
 thunk0 MACRO name, target
 name PROC
@@ -191,4 +193,5 @@ thunk0 psbTWinGetRuntimeName,       psbXGetRuntimeName
 thunk6 psbTWinGnmSubmit,            psbXGnmSubmitCommandBuffers   ; 6 args
 thunk0 psbTWinStackChkFail,         psbXStackChkFail
 
+_TEXT ENDS
 END
