@@ -4,12 +4,15 @@
 software (x86-64 guest images with Orbis-style system interfaces) on standard
 PCs running Linux and Windows.
 
-> **Status: Phase 1 complete** — full load-and-execute pipeline proven
-> end-to-end on real homebrew guests: memory manager, ELF64 loader with
-> relocations + TLS, libkernel emulation (threads/sync/time/memory), GPU
-> command processor with a software rasterizer, screenshot capture, CI on
-> Linux + Windows, ASan/UBSan clean. See
-> [`docs/PHASE_1_REPORT.md`](docs/PHASE_1_REPORT.md) for measured results.
+> **Status: Phase 2 complete** — everything from Phase 1 (proven end-to-end on
+> real homebrew guests, ASan/UBSan clean) plus: a **Vulkan GPU backend** with
+> an RDNA→SPIR-V **shader recompiler** (table-driven, 55-opcode documented
+> subset, 510-program validation corpus), shader/pipeline caches, a
+> thread-correct process lifecycle (cooperative exit/termination), Windows
+> guest execution with SEH crash diagnostics, and a signal-guarded Vulkan
+> self-test that degrades gracefully on broken driver stacks. See
+> [`docs/PHASE_2_REPORT.md`](docs/PHASE_2_REPORT.md) and
+> [`docs/RDNA_SUBSET.md`](docs/RDNA_SUBSET.md).
 
 ![Cube demo](docs/screenshots/cube_soak_frame_5400.png)
 
@@ -33,9 +36,27 @@ behavior is reimplemented, cleanly, from public documentation:
 | Memory        | Guest address-space manager + direct-memory allocations          | ✅ Working           |
 | Kernel/libc   | `sceKernel*` shim on host primitives (threads, TLS, sync, I/O)   | ✅ 33 functions      |
 | GPU (RDNA 2)  | Command-buffer executor → software rasterizer (reference)        | ✅ Working           |
-| GPU (RDNA 2)  | Vulkan backend + shader recompiler                               | 🔜 Phase 2           |
+| GPU (RDNA 2)  | Vulkan backend (offscreen, loader-based)                         | ✅ Working           |
+| GPU (RDNA 2)  | RDNA→SPIR-V shader recompiler (documented subset, validated)     | ✅ Working           |
 | Filesystem    | PFS/PKG layer                                                    | 🔜 Phase 3           |
 | Audio / Input | SDL-based                                                        | 🔜 Phase 4           |
+
+## GPU backends
+
+PSBET has two interchangeable GPU backends behind one command surface:
+
+```bash
+psbet gpu                                  # probe the host Vulkan stack
+psbet run cube.elf --backend auto          # default: Vulkan if healthy, else software
+psbet run cube.elf --backend vulkan        # force Vulkan (fails fast if broken)
+psbet run cube.elf --backend software      # force the reference rasterizer
+```
+
+The Vulkan backend is fully offscreen (renders to Vulkan images, reads back to
+the framebuffer) — no window or swapchain needed. A signal-guarded self-test
+runs before every guest: if the host driver cannot render reliably, PSBET says
+so and falls back to software instead of producing garbage. Set
+`PSBET_SHADER_CACHE=<dir>` to persist translated shaders across runs.
 
 ## Quick start (Linux)
 

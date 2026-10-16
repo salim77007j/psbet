@@ -41,6 +41,9 @@ gcc -shared -fPIC -nostartfiles -Wl,-e,psb_entry -Wl,--build-id=none -O2 \
 ```c
 void psb_entry(void);                 // called once on the main thread
 sceKernelExitProcess(int32_t status); // ends the process; exit code surfaces
+// v1.1 semantics: callable from ANY guest thread. A worker's exit unwinds
+// that worker's own frames (it stays joinable), wakes every blocking
+// primitive, and the supervisor delivers the FIRST recorded exit code.
                                       // to the host CLI / test harness
 typedef int32_t (*PsbThreadEntry)(size_t arglen, void* argp);
 sceKernelCreateThread(name, entry, prio, stackSize, attr, affinity, &tid);

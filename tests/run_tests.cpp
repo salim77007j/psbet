@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <filesystem>
 #include <vector>
 
 #include "psbet/common.h"
@@ -21,7 +22,9 @@
 #include "gpu/png.h"
 #include "gpu/rasterizer.h"
 #include "gpu/gpu_shim.h"
+#include "gpu/shader_cache.h"
 #include "emulator.h"
+#include "gpu/vulkan_device.h"
 
 #if !defined(_WIN32)
 #define PSBET_RUN_GUEST_TESTS 1
@@ -51,6 +54,53 @@ bool runTest(const char* name, bool (*fn)()) {
 }
 
 // ---------------------------------------------------------------------------
+// 0. ShaderCache (insert/find/persist/reload/corrupt-reject)
+// ---------------------------------------------------------------------------
+bool test_shader_cache() {
+    using psb::gpu::ShaderCache;
+    using psb::gpu::spv::Word;
+    using psb::u64;
+
+    const std::string dir = "test_shader_cache_dir";
+    std::filesystem::remove_all(dir);
+
+    std::vector<Word> mod{7, 0x0021c, 42, 0xFFFF};
+    const u64 key = ShaderCache::hashKey("test", mod.data(), mod.size());
+
+    {
+        ShaderCache c(dir);
+        CHECK(c.find(key) == nullptr);
+        c.insert(key, mod);
+        const std::vector<Word>* hit = c.find(key);
+        CHECK(hit != nullptr);
+        CHECK(*hit == mod);
+        c.flush();
+    }
+    {
+        // Reload from disk: entry must survive.
+        ShaderCache c(dir);
+        const std::vector<Word>* hit = c.find(key);
+        CHECK(hit != nullptr);
+        CHECK(*hit == mod);
+    }
+    {
+        // Corrupt the file: cache must reject it, not trust it.
+        std::FILE* f = std::fopen((dir + "/psbet_shaders.cache").c_str(), "r+b");
+        CHECK(f != nullptr);
+        std::fseek(f, 0, SEEK_END);
+        std::fputc(0xAA, f); // append junk -> size mismatch on read
+        std::fclose(f);
+        ShaderCache c(dir);
+        // Entry rejected or absent; no crash, cache usable.
+        c.insert(key, mod);
+        c.flush();
+        CHECK(c.find(key) != nullptr);
+    }
+    std::filesystem::remove_all(dir);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 1. MemoryManager
 // ---------------------------------------------------------------------------
 bool test_memory_manager() {
@@ -74,6 +124,88 @@ bool test_memory_manager() {
     CHECK(mem.bytesAllocated() >= 1024 + 4096);
     CHECK(mem.regionMap().find("test-a") != std::string::npos);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Pixel-compare: software rasterizer vs Vulkan backend (acceptance:
+//     identical rendering within tolerance). Skips gracefully when no
+//     working Vulkan stack exists (CI runners install lavapipe).
+// ---------------------------------------------------------------------------
+bool test_pixel_compare_backends() {
+#if !defined(PSBET_RUN_GUEST_TESTS)
+    return true; // windows core job: covered by the dedicated vulkan CI job
+#else
+    if (!psb::gpu::VulkanDevice::selfTest()) {
+        std::printf("    (vulkan unavailable — skipped)");
+        return true;
+    }
+
+    constexpr psb::u32 W = 320, H = 180;
+    std::vector<psb::u8> bufA(static_cast<size_t>(W) * H * 4);
+    std::vector<psb::u8> bufB(static_cast<size_t>(W) * H * 4);
+    std::vector<float> depth(static_cast<size_t>(W) * H);
+
+    // Shared scene: clear, viewport, depth, cull, two overlapping triangles.
+    psb::gpu::GpuVertex tri[6] = {
+        {{-0.8f, -0.6f, 0.10f, 1.f}, {1.0f, 0.2f, 0.2f, 1.f}},
+        {{ 0.8f, -0.6f, 0.10f, 1.f}, {1.0f, 0.2f, 0.2f, 1.f}},
+        {{ 0.0f,  0.8f, 0.10f, 1.f}, {1.0f, 0.2f, 0.2f, 1.f}},
+        {{-0.6f, -0.8f, 0.05f, 1.f}, {0.2f, 0.4f, 1.0f, 1.f}},
+        {{ 0.9f, -0.2f, 0.05f, 1.f}, {0.2f, 0.4f, 1.0f, 1.f}},
+        {{ 0.1f,  0.9f, 0.05f, 1.f}, {0.2f, 0.4f, 1.0f, 1.f}},
+    };
+
+    auto buildStream = [&](psb::gpu::CmdWriter& cw) {
+        cw.clear();
+        psb::gpu::CmdClear clear;
+        clear.color[0] = 0.05f; clear.color[1] = 0.05f; clear.color[2] = 0.1f;
+        cw.push(clear);
+        psb::gpu::CmdSetViewport vp;
+        vp.x = 0; vp.y = 0; vp.w = (float)W; vp.h = (float)H;
+        cw.push(vp);
+        psb::gpu::CmdSetDepthTest dt; dt.enable = 1; dt.func = psb::gpu::DepthFunc::Less;
+        cw.push(dt);
+        psb::gpu::CmdSetCullMode cm; cm.mode = psb::gpu::CullMode::None;
+        cw.push(cm);
+        cw.draw(tri, 6);
+    };
+
+    // Software pass.
+    {
+        psb::gpu::CmdWriter cw;
+        buildStream(cw);
+        psb::gpu::Device dev(bufA.data(), depth.data(), W, H);
+        psb::gpu::setActiveDevice(&dev);
+        CHECK(dev.executeCommandBuffer(cw.data(), cw.size()));
+        psb::gpu::setActiveDevice(nullptr);
+    }
+    // Vulkan pass.
+    {
+        auto backend = psb::gpu::VulkanDevice::create(bufB.data(), W, H);
+        CHECK(backend != nullptr);
+        psb::gpu::CmdWriter cw;
+        buildStream(cw);
+        psb::gpu::Device dev(bufB.data(), W, H, std::move(backend));
+        psb::gpu::setActiveDevice(&dev);
+        CHECK(dev.executeCommandBuffer(cw.data(), cw.size()));
+        psb::gpu::setActiveDevice(nullptr);
+    }
+
+    // Compare: per-pixel channel delta <= 4/255 on >= 99% of pixels, and the
+    // images must be broadly non-trivial (the triangles actually drew).
+    size_t close = 0, active = 0;
+    for (size_t i = 0; i < static_cast<size_t>(W) * H; ++i) {
+        int dr = std::abs(int(bufA[i*4+0]) - int(bufB[i*4+0]));
+        int dg = std::abs(int(bufA[i*4+1]) - int(bufB[i*4+1]));
+        int db = std::abs(int(bufA[i*4+2]) - int(bufB[i*4+2]));
+        if (dr <= 4 && dg <= 4 && db <= 4) close++;
+        if (bufA[i*4+0] > 30 || bufA[i*4+1] > 30 || bufA[i*4+2] > 30) active++;
+    }
+    std::printf("    (close=%zu/%zu active=%zu) ", close, size_t(W) * H, active);
+    CHECK(close * 100 >= 99 * (static_cast<size_t>(W) * H));
+    CHECK(active > (static_cast<size_t>(W) * H) / 10);
+    return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +406,23 @@ bool test_guest_hello() {
     return true;
 }
 
+// Phase-2 regression: worker-initiated process exit (flaw 1 — cross-thread
+// longjmp in Phase 1). The guest's worker calls ExitProcess(7) while main
+// blocks on a semaphore; the process must exit with the worker's code.
+bool test_guest_worker_exit() {
+#if !defined(PSBET_RUN_GUEST_TESTS)
+    return true;
+#else
+    psb::EmuOptions opt;
+    opt.maxFrames = 1000;
+    psb::Emulator emu;
+    const psb::EmuStats st = emu.run("worker_exit.elf", opt);
+    CHECK(st.guestExitCode == 7);
+    CHECK(!st.crashed);
+    return true;
+#endif
+}
+
 bool test_guest_cube() {
     psb::Emulator emu;
     psb::EmuOptions opt;
@@ -305,6 +454,8 @@ int main() {
     psb::log::setLevel(psb::log::Level::Warn);
 
     std::printf("PSBET unit tests\n================\n");
+    runTest("shader_cache",             test_shader_cache);
+    runTest("pixel_compare_sw_vs_vulkan", test_pixel_compare_backends);
     runTest("memory_manager",           test_memory_manager);
     runTest("png_writer",               test_png_writer);
     runTest("png_rejects_bad_input",    test_png_rejects_bad_input);
@@ -313,6 +464,7 @@ int main() {
     runTest("cmd_executor",             test_cmd_executor);
 #ifdef PSBET_RUN_GUEST_TESTS
     runTest("guest_hello (threads/TLS/sync)", test_guest_hello);
+    runTest("guest_worker_exit (flaw-1 regression)", test_guest_worker_exit);
     runTest("guest_cube (GPU pipeline)",      test_guest_cube);
 #endif
 

@@ -3,9 +3,12 @@
 // ============================================================================
 #include "emulator.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 
 #include "core/log.h"
 #include "core/memory.h"
@@ -14,6 +17,7 @@
 #include "core/cpu_supervisor.h"
 #include "gpu/gpu_shim.h"
 #include "gpu/png.h"
+#include "gpu/vulkan_device.h"
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -105,14 +109,50 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     auto* colorBuf = reinterpret_cast<u8*>(fbAddr);
     auto* depthBuf = reinterpret_cast<float*>(fbAddr + colorBytes);
 
-    gpu::Device device(colorBuf, depthBuf, opt.width, opt.height);
-    device.setMaxFrames(opt.maxFrames);
-    gpu::setActiveDevice(&device);
+    // ---- backend selection (auto | software | vulkan) ----------------------
+    std::string wantBackend = opt.backend.empty() ? "auto" : opt.backend;
+    std::for_each(wantBackend.begin(), wantBackend.end(),
+                  [](char& c) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+
+    std::unique_ptr<gpu::IRasterBackend> backend;
+    if (wantBackend == "vulkan" || wantBackend == "auto") {
+        if (!gpu::VulkanDevice::selfTest()) {
+            LOG_WARN("Emulator: Vulkan self-test failed — the host Vulkan stack "
+                     "cannot render reliably in this environment");
+            if (wantBackend == "vulkan") {
+                LOG_ERROR("Emulator: Vulkan backend requested but failed self-test");
+                stats.guestExitCode = 3;
+                return stats;
+            }
+        } else {
+            backend = gpu::VulkanDevice::create(colorBuf, opt.width, opt.height);
+            if (!backend && wantBackend == "vulkan") {
+                LOG_ERROR("Emulator: Vulkan backend requested but unavailable");
+                stats.guestExitCode = 3;
+                return stats;
+            }
+        }
+    }
+
+    std::unique_ptr<gpu::Device> device;
+    if (backend) {
+        device = std::make_unique<gpu::Device>(colorBuf, opt.width, opt.height,
+                                               std::move(backend));
+        stats.backendUsed = "vulkan";
+        LOG_INFO("Emulator: GPU backend: Vulkan");
+    } else {
+        device = std::make_unique<gpu::Device>(colorBuf, depthBuf, opt.width, opt.height);
+        stats.backendUsed = "software";
+        LOG_INFO("Emulator: GPU backend: software rasterizer%s",
+                 wantBackend == "auto" ? " (auto — Vulkan unavailable)" : "");
+    }
+    device->setMaxFrames(opt.maxFrames);
+    gpu::setActiveDevice(device.get());
 
     if (!opt.screenshotDir.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(opt.screenshotDir, ec);
-        device.setFrameHook([&](u64 frame) {
+        device->setFrameHook([&](u64 frame) {
             if (opt.screenshotInterval == 0) return;
             if (frame % opt.screenshotInterval != 0) return;
             gpu::Image img;
@@ -140,6 +180,8 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     LOG_INFO("Emulator: entering guest (%s)", elfPath.c_str());
     GuestRunResult run = cpu::runGuestEntry(mod, kernel::KernelState::get());
     gpu::setActiveDevice(nullptr);
+    const u64 framesRendered = device ? device->frameCount() : 0;
+    device.reset(); // destroy backend before the memory arena goes away
 
     // ---- 5. Teardown + stats -----------------------------------------------
     kernel::KernelState::get().shutdownThreads();
@@ -148,7 +190,7 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     stats.exitedViaGuest = run.exitedViaGuest;
     stats.crashed = !run.crashReport.empty();
     stats.crashReport = run.crashReport;
-    stats.frames = device.frameCount();
+    stats.frames = framesRendered;
     stats.elapsedMs = (nowUs() - t0) / 1000;
     stats.avgFps = stats.elapsedMs > 0
         ? static_cast<double>(stats.frames) * 1000.0 / static_cast<double>(stats.elapsedMs)

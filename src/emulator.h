@@ -16,6 +16,7 @@ struct EmuOptions {
     u32         screenshotInterval = 30;   // capture every N frames
     u32         maxFrames = 1000000;       // safety frame limit
     bool        verbose = false;
+    std::string backend = "auto";    // auto | software | vulkan
 };
 
 struct EmuStats {
@@ -28,6 +29,7 @@ struct EmuStats {
     u32    screenshots = 0;
     u64    peakRssKiB = 0;
     std::string crashReport;
+    std::string backendUsed;         // "software" | "vulkan"
 };
 
 class Emulator {

@@ -15,8 +15,18 @@ Device* g_device = nullptr;
 }
 
 Device::Device(u8* colorBuf, float* depthBuf, u32 width, u32 height)
-    : color_(colorBuf), depth_(depthBuf), width_(width), height_(height),
-      raster_(colorBuf, depthBuf, width, height) {}
+    : color_(colorBuf), width_(width), height_(height) {
+    backend_ = std::make_unique<Rasterizer>(colorBuf, depthBuf, width, height);
+    backendName_ = "software";
+}
+
+Device::Device(u8* colorBuf, u32 width, u32 height,
+               std::unique_ptr<IRasterBackend> backend)
+    : color_(colorBuf), width_(width), height_(height), backend_(std::move(backend)) {
+    backendName_ = "vulkan"; // the only non-software backend in Phase 2
+}
+
+Device::~Device() = default;
 
 void setActiveDevice(Device* device) { g_device = device; }
 Device* activeDevice()               { return g_device; }
@@ -43,7 +53,7 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                 if (hdr.size < sizeof(CmdClear)) return false;
                 CmdClear pkt;
                 std::memcpy(&pkt, cursor, sizeof(pkt));
-                raster_.clear(pkt.color[0], pkt.color[1], pkt.color[2], pkt.color[3]);
+                backend_->clear(pkt.color[0], pkt.color[1], pkt.color[2], pkt.color[3]);
                 break;
             }
 
@@ -51,7 +61,7 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                 if (hdr.size < sizeof(CmdSetViewport)) return false;
                 CmdSetViewport pkt;
                 std::memcpy(&pkt, cursor, sizeof(pkt));
-                raster_.setViewport(pkt.x, pkt.y, pkt.w, pkt.h);
+                backend_->setViewport(pkt.x, pkt.y, pkt.w, pkt.h);
                 break;
             }
 
@@ -59,7 +69,7 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                 if (hdr.size < sizeof(CmdSetDepthTest)) return false;
                 CmdSetDepthTest pkt;
                 std::memcpy(&pkt, cursor, sizeof(pkt));
-                raster_.setDepthTest(pkt.enable != 0, pkt.func);
+                backend_->setDepthTest(pkt.enable != 0, pkt.func);
                 break;
             }
 
@@ -67,7 +77,7 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                 if (hdr.size < sizeof(CmdSetCullMode)) return false;
                 CmdSetCullMode pkt;
                 std::memcpy(&pkt, cursor, sizeof(pkt));
-                raster_.setCullMode(pkt.mode);
+                backend_->setCullMode(pkt.mode);
                 break;
             }
 
@@ -82,13 +92,11 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                               hdr.size, want);
                     return false;
                 }
-                GpuVertex v;
                 // Copy vertices into a local buffer to avoid alignment issues.
                 std::vector<GpuVertex> verts(pkt.vertexCount);
                 std::memcpy(verts.data(), cursor + sizeof(CmdDrawTriangles),
                             static_cast<size_t>(pkt.vertexCount) * sizeof(GpuVertex));
-                raster_.drawTriangles(verts.data(), pkt.vertexCount);
-                (void)v;
+                backend_->drawTriangles(verts.data(), pkt.vertexCount);
                 break;
             }
 
@@ -100,6 +108,8 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
 
         cursor += hdr.size;
     }
+
+    backend_->frameEnd(); // Vulkan: submit + readback; software: no-op
     return true;
 }
 

@@ -8,10 +8,16 @@ on:
 
 jobs:
   linux:
-    name: Linux build + tests + demo
+    name: Linux build + tests + Vulkan + demo
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Vulkan software driver (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -19,19 +25,36 @@ jobs:
       - name: Build (strict warnings = errors)
         run: cmake --build build -j"$(nproc)"
 
-      - name: Unit tests
+      - name: Probe Vulkan stack
+        working-directory: build
+        run: ./psbet gpu
+
+      - name: Unit + integration tests (software AND Vulkan backends)
         working-directory: build
         run: ./psbet_tests
 
-      - name: Run cube demo (headless software GPU) + capture screenshots
+      - name: RDNA subset corpus tests
+        working-directory: build
+        run: ./psbet_rdna_tests
+
+      - name: Run cube demo (Vulkan backend) + capture screenshots
         working-directory: build
         run: |
           ./psbet run hello.elf
           # Frame limit (124) is the designed, controlled exit for the demo.
-          # bash -e would abort on it, so capture the code defensively.
           rc=0
-          ./psbet run cube.elf --frames 90 --screenshot-dir shots --screenshot-interval 30 || rc=$?
-          echo "psbet exit code: $rc"
+          ./psbet run cube.elf --backend vulkan --frames 90 \
+              --screenshot-dir shots-vk --screenshot-interval 30 || rc=$?
+          echo "psbet (vulkan) exit code: $rc"
+          test "$rc" -eq 124
+
+      - name: Run cube demo (software backend, reference) + screenshots
+        working-directory: build
+        run: |
+          rc=0
+          ./psbet run cube.elf --backend software --frames 90 \
+              --screenshot-dir shots-sw --screenshot-interval 30 || rc=$?
+          echo "psbet (software) exit code: $rc"
           test "$rc" -eq 124
 
       - name: Upload Linux binaries
@@ -42,18 +65,40 @@ jobs:
             build/psbet
             build/hello.elf
             build/cube.elf
+            build/worker_exit.elf
 
-      - name: Upload demo screenshots
+      - name: Upload Vulkan demo screenshots
         uses: actions/upload-artifact@v4
         with:
-          name: psbet-demo-screenshots
-          path: build/shots/*.png
+          name: psbet-demo-screenshots-vulkan
+          path: build/shots-vk/*.png
+
+      - name: Upload software demo screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-demo-screenshots-software
+          path: build/shots-sw/*.png
+
+      - name: Upload guest ELF images (for the Windows job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-guest-elves
+          path: |
+            build/hello.elf
+            build/cube.elf
+            build/worker_exit.elf
 
   linux-asan:
     name: Linux ASan/UBSan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Vulkan software driver (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+          echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
 
       - name: Configure (sanitizers)
         run: >
@@ -70,7 +115,8 @@ jobs:
         run: ./psbet_tests
 
   windows:
-    name: Windows build + core tests
+    name: Windows build + guest execution
+    needs: linux          # ELF guest images are cross-built by the GCC toolchain
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,9 +127,46 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # Phase 1: guest ELF execution is Linux-only (documented in the report);
-      # the Windows job validates the portable core (memory, PNG, rasterizer,
-      # command executor). Guest pipeline tests are compiled out on WIN32.
+      - name: Core tests (memory, PNG, rasterizer, command executor, cache)
+        working-directory: build
+        run: Release\psbet_tests.exe
+
+      # Phase 2: the Windows hosting shim runs the REAL ELF guest images
+      # (built by the Linux job's GCC — guests are toolchain-independent:
+      # PSBET itself is their "OS"). Exit code 124 is the designed frame-limit
+      # exit for the demo.
+      - name: Download guest ELF images
+        uses: actions/download-artifact@v4
+        with:
+          name: psbet-guest-elves
+          path: guests
+
+      - name: Run hello.elf on Windows
+        working-directory: build
+        run: |
+          Release\psbet.exe run ..\guests\hello.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run worker_exit.elf on Windows (cooperative exit regression)
+        working-directory: build
+        run: |
+          Release\psbet.exe run ..\guests\worker_exit.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 7) { exit $LASTEXITCODE }
+
+      - name: Run cube.elf on Windows + screenshots
+        working-directory: build
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "Release\psbet.exe" `
+            -ArgumentList "run","..\guests\cube.elf","--frames","90",`
+                          "--screenshot-dir","..\shots-win","--screenshot-interval","30" `
+            -PassThru -NoNewWindow
+          $p.WaitForExit()
+          echo "exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 124) { exit $p.ExitCode }
+          Get-ChildItem ..\shots-win
 
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
@@ -92,3 +175,9 @@ jobs:
           path: |
             build/Release/psbet.exe
             build/Release/psbet_tests.exe
+
+      - name: Upload Windows guest screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-demo-screenshots-windows
+          path: shots-win/*.png

@@ -27,9 +27,20 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #endif
 
 namespace psb::kernel {
+
+// ---------------------------------------------------------------------------
+// Cooperative wake state — every blocking kernel primitive and every parked
+// thread waits on these, so exit/shutdown can always make progress.
+// ---------------------------------------------------------------------------
+namespace {
+std::mutex              g_wakeMtx;
+std::condition_variable g_wakeCv;
+}
 
 // ---------------------------------------------------------------------------
 // Internal record types + thread-local state
@@ -70,6 +81,14 @@ thread_local ThreadExitEnv g_threadExitEnv;
 
 jmp_buf* g_processEnv = nullptr;   // owned by CPU supervisor (main thread)
 std::atomic<i32> g_exitInFlight{0};
+std::atomic<bool> g_shutdown{false};
+
+// Supervisor thread identity — set by runGuestEntry via beginSupervisorScope.
+thread_local bool g_isSupervisor = false;
+
+// Serializes all guest-visible console writes (guest sceKernelWrite + engine
+// log tail) so lines never interleave mid-line (Phase-1 flaw fix).
+std::mutex g_consoleMtx;
 
 } // namespace
 
@@ -88,7 +107,49 @@ void KernelState::init(MemoryManager* mem) {
     handleKinds_.clear();
     exitRequested_ = false;
     exitCode_ = 0;
-    g_exitInFlight.store(0); // allow a fresh exit path for this guest run
+    g_exitInFlight.store(0);   // allow a fresh exit path for this guest run
+    g_shutdown.store(false);   // fresh cooperative-shutdown state
+    g_wakeCv.notify_all();
+}
+
+// --- cooperative wake state -------------------------------------------------
+
+void requestShutdown() {
+    g_shutdown.store(true);
+    g_wakeCv.notify_all();
+}
+
+bool shutdownRequested() { return g_shutdown.load(); }
+
+bool isSupervisorThread() { return g_isSupervisor; }
+
+void beginSupervisorScope() { g_isSupervisor = true; }
+void endSupervisorScope()   { g_isSupervisor = false; }
+
+// Wait helper: waits on `cv` with predicate `pred`, but wakes when either the
+// predicate is satisfied, the process exit was requested, or shutdown began.
+// Returns false when woken by exit/shutdown (caller returns an error).
+template <typename Cv, typename Pred>
+static bool wakeableWait(std::unique_lock<std::mutex>& lk, Cv& cv, Pred pred) {
+    if (pred()) return true;
+    while (!pred()) {
+        if (KernelState::get().exitRequested() || shutdownRequested())
+            return pred(); // may be false — caller decides
+        cv.wait_for(lk, std::chrono::milliseconds(2), pred);
+    }
+    return true;
+}
+
+template <typename Pred>
+static bool wakeableWaitAny(std::unique_lock<std::recursive_mutex>& lk,
+                            std::condition_variable_any& cv, Pred pred) {
+    if (pred()) return true;
+    while (!pred()) {
+        if (KernelState::get().exitRequested() || shutdownRequested())
+            return pred();
+        cv.wait_for(lk, std::chrono::milliseconds(2), pred);
+    }
+    return true;
 }
 
 i32 KernelState::addHandle(std::shared_ptr<void> obj, const char* kind) {
@@ -143,35 +204,91 @@ void* processJmpBuf()            { return g_processEnv; }
 
 void KernelState::requestProcessExit(i32 exitCode) {
     i32 expected = 0;
-    if (!g_exitInFlight.compare_exchange_strong(expected, 1)) {
-        // A second exit request while one is in flight (e.g. racing threads):
-        // park this thread so it cannot unwind guest frames mid-teardown.
-        for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+    const bool first = g_exitInFlight.compare_exchange_strong(expected, 1);
+    if (first) {
+        exitCode_ = exitCode;
+        exitRequested_ = true;
+        g_wakeCv.notify_all(); // wake anyone blocked in kernel primitives
     }
-    exitCode_ = exitCode;
-    exitRequested_ = true;
-    if (g_processEnv) longjmp(*g_processEnv, 1);
-    // No supervisor env registered (should not happen): hard exit.
-    LOG_ERROR("Kernel: process exit without supervisor env — forcing exit(%d)", exitCode);
-    std::quick_exit(exitCode);
+
+    if (isSupervisorThread()) {
+        // Same-thread exit: unwind guest frames through the supervisor env.
+        if (g_processEnv) longjmp(*g_processEnv, 1);
+        LOG_ERROR("Kernel: process exit without supervisor env — forcing exit(%d)", exitCode);
+        std::quick_exit(exitCode);
+    }
+
+    // Worker thread: unwind OUR OWN guest frames via our thread exit env —
+    // the exact mechanism as sceKernelExitThread. The thread then finishes
+    // normally and stays joinable (Phase-1 parked-forever flaw fixed).
+    if (g_threadExitEnvValid) {
+        g_pendingRetVal = first ? exitCode : 0;
+        longjmp(g_threadExitEnv.buf, 1);
+    }
+
+    // Worker outside guest frames (should not happen): park until shutdown,
+    // then block indefinitely in host code — never unwinding guest frames.
+    LOG_WARN("Kernel: ExitProcess from non-guest worker — parking until shutdown");
+    std::unique_lock<std::mutex> lk(g_wakeMtx);
+    g_wakeCv.wait(lk, [] { return shutdownRequested(); });
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
 }
 
 bool KernelState::exitRequested() const { return exitRequested_; }
 i32  KernelState::exitCode() const      { return exitCode_; }
 
 void KernelState::shutdownThreads() {
+    requestShutdown(); // wake every primitive blocked in this process
+    std::vector<std::shared_ptr<ThreadRec>> stragglers;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (size_t i = 0; i < handles_.size(); ++i) {
+            if (handleKinds_[i] != "thread") continue;
+            auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
+            if (!rec->thread.joinable()) continue;
+            if (rec->finished) continue;          // joined below in one pass
+        }
+    }
+
+    // One join pass for finished threads, then a bounded cooperative grace
+    // for the rest (they were woken by requestShutdown).
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(200);
+    for (;;) {
+        bool allDone = true;
+        std::vector<std::shared_ptr<ThreadRec>> stillRunning;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (size_t i = 0; i < handles_.size(); ++i) {
+                if (handleKinds_[i] != "thread") continue;
+                auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
+                if (!rec->thread.joinable()) continue;
+                if (rec->finished || std::chrono::steady_clock::now() > deadline) {
+                    stillRunning.push_back(rec);
+                } else {
+                    allDone = false;
+                    stillRunning.push_back(rec);
+                }
+            }
+        }
+        for (auto& rec : stillRunning) {
+            if (rec->finished && rec->thread.joinable()) rec->thread.join();
+        }
+        if (allDone || std::chrono::steady_clock::now() > deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // Anything still running after the grace period is detached (logged).
+    // Compute-bound guest code cannot be preempted portably; this is the
+    // documented best-effort boundary.
     std::lock_guard<std::mutex> lk(mtx_);
     for (size_t i = 0; i < handles_.size(); ++i) {
         if (handleKinds_[i] != "thread") continue;
         auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
-        if (rec->thread.joinable()) {
-            if (rec->finished) {
-                rec->thread.join();
-            } else {
-                LOG_WARN("kernel: guest thread '%s' still running at exit — detaching",
-                         rec->name.c_str());
-                rec->thread.detach();
-            }
+        if (rec->thread.joinable() && !rec->finished) {
+            LOG_WARN("kernel: guest thread '%s' still running at shutdown — detaching",
+                     rec->name.c_str());
+            rec->thread.detach();
         }
     }
 }
@@ -302,11 +419,21 @@ int32_t sceKernelStartThread(int32_t tid, size_t arglen, void* argp) {
 }
 
 int32_t sceKernelWaitThreadEnd(int32_t tid, int32_t* retVal, uint64_t* timeoutUs) {
-    (void)timeoutUs; // Phase 1: unbounded waits
+    (void)timeoutUs; // cooperative unbounded wait
     auto rec = std::static_pointer_cast<ThreadRec>(
         KernelState::get().getHandle(tid, "thread"));
     if (!rec) return -1;
-    if (rec->thread.joinable()) rec->thread.join();
+    if (rec->thread.joinable()) {
+        // Poll the finished flag so a worker-initiated process exit wakes us.
+        while (!rec->finished) {
+            if (KernelState::get().exitRequested() || shutdownRequested()) {
+                LOG_DEBUG("kernel: WaitThreadEnd aborted by exit/shutdown");
+                return -1;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        rec->thread.join();
+    }
     if (retVal) *retVal = rec->retVal;
     return 0;
 }
@@ -372,12 +499,15 @@ int32_t sceKernelCreateSemaphore(const char* name, int32_t initCount,
 }
 
 int32_t sceKernelWaitSemaphore(int32_t semaId, int32_t needCount, uint64_t timeoutUs) {
-    (void)timeoutUs; // Phase 1: unbounded waits
+    (void)timeoutUs; // Phase 2: unbounded waits are cooperative (see below)
     auto rec = std::static_pointer_cast<SemaRec>(
         KernelState::get().getHandle(semaId, "sema"));
     if (!rec || needCount <= 0) return -1;
     std::unique_lock<std::mutex> lk(rec->mtx);
-    rec->cv.wait(lk, [&] { return rec->count >= needCount; });
+    if (!wakeableWait(lk, rec->cv, [&] { return rec->count >= needCount; })) {
+        LOG_DEBUG("kernel: WaitSemaphore aborted by exit/shutdown");
+        return -1;
+    }
     rec->count -= needCount;
     return 0;
 }
@@ -410,10 +540,11 @@ int32_t sceKernelWaitCond(int32_t condId, int32_t mutexId, uint64_t timeoutUs) {
         KernelState::get().getHandle(mutexId, "mutex"));
     if (!cond || !mtx) return -1;
     std::unique_lock<std::recursive_mutex> lk(mtx->mtx);
-    if (timeoutUs == 0)
-        cond->cv.wait(lk);
-    else
+    if (timeoutUs == 0) {
+        wakeableWaitAny(lk, cond->cv, [] { return false; }); // pure wait: wake only
+    } else {
         cond->cv.wait_for(lk, std::chrono::microseconds(timeoutUs));
+    }
     return 0;
 }
 
@@ -434,12 +565,23 @@ int32_t sceKernelSignalCondAll(int32_t condId) {
 }
 
 // ---- I/O ------------------------------------------------------------------
+// Phase-1 console-interleaving flaw fixed: guest writes share the engine's
+// console mutex and flush at each write, so lines never interleave mid-line
+// between guest stdout and host stderr logging.
 int64_t sceKernelWrite(int32_t fd, const void* buf, size_t n) {
+    if (!buf) return -1;
+    std::lock_guard<std::mutex> lk(g_consoleMtx);
 #if !defined(_WIN32)
-    return ::write(fd, buf, n);
+    const ssize_t r = ::write(fd, buf, n);
+    if (fd == 1 || fd == 2) ::fsync(fd); // flush ordering vs host logging
+    return static_cast<int64_t>(r);
 #else
-    (void)fd; (void)buf; (void)n;
-    return -1;
+    HANDLE h = fd == 1 ? GetStdHandle(STD_OUTPUT_HANDLE)
+                       : fd == 2 ? GetStdHandle(STD_ERROR_HANDLE) : nullptr;
+    if (!h || h == INVALID_HANDLE_VALUE) return -1;
+    DWORD written = 0;
+    if (!WriteFile(h, buf, static_cast<DWORD>(n), &written, nullptr)) return -1;
+    return static_cast<int64_t>(written);
 #endif
 }
 
@@ -448,7 +590,7 @@ int64_t sceKernelRead(int32_t fd, void* buf, size_t n) {
     return ::read(fd, buf, n);
 #else
     (void)fd; (void)buf; (void)n;
-    return -1;
+    return -1; // stdin reads arrive with the SDL input phase
 #endif
 }
 
@@ -456,8 +598,14 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint32_t mode) {
 #if !defined(_WIN32)
     return ::open(path, flags, static_cast<mode_t>(mode));
 #else
-    (void)path; (void)flags; (void)mode;
-    return -1;
+    // Map the common guest flag subset to _open (read/write/create).
+    int m = _O_BINARY;
+    if (flags & 0x1) m |= _O_WRONLY;                 // O_WRONLY (subset bit)
+    else if (flags & 0x2) m |= _O_RDWR;              // O_RDWR
+    else m |= _O_RDONLY;
+    if (flags & 0x40) m |= _O_CREAT;                 // O_CREAT
+    if (flags & 0x200) m |= _O_TRUNC;                // O_TRUNC
+    return ::_open(path, m, static_cast<int>(mode));
 #endif
 }
 
@@ -465,8 +613,7 @@ int32_t sceKernelClose(int32_t fd) {
 #if !defined(_WIN32)
     return ::close(fd);
 #else
-    (void)fd;
-    return -1;
+    return ::_close(fd);
 #endif
 }
 

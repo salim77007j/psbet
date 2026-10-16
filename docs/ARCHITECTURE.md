@@ -246,3 +246,31 @@ framegraph.
 | `longjmp` across frames with nontrivial destructors | Host leaks on forced exit | Guests use static command buffers (already true for cube); Phase 3 adds unwinding-aware teardown |
 | RDNA shader recompiler scale | The largest engineering item | Phase 2 starts with compute-free vertex/fragment path over Vulkan; ISA disassembler is standalone and testable |
 | Commercial-title long tail | Compatibility work is open-ended | Crash-report offsets + capture/replay harness (Phase 6) turns anecdotes into regression tests |
+
+
+---
+
+## 10. Phase 2 addendum — GPU translation layer
+
+```
+guest PBFF command buffer
+        │
+        ▼
+  Device (parse + validate)          ── one shared surface
+        │
+        ├── IRasterBackend::software → Rasterizer (reference oracle)
+        └── IRasterBackend::vulkan   → VulkanDevice
+                │  loader-based (no SDK), offscreen images
+                │  fixed-equivalent pipeline (SPIR-V built by spirv_emit)
+                │  shader cache (disk, CRC-checked) + VkPipelineCache
+                └── RDNA subset → SPIR-V recompiler (rdna_spirv)
+                        └── docs/RDNA_SUBSET.md is the normative contract
+```
+
+Backend selection is per-run (`--backend auto|software|vulkan`). Before any
+guest runs, the Vulkan path self-tests (render a known triangle under a
+signal guard, verify readback) and falls back to software on failure — a
+broken host driver can never take the process down or silently corrupt
+output. Risk register addition: llvmpipe JIT faults inside
+`vkCreateGraphicsPipelines` on some sandboxed kernels (observed, contained by
+the self-test; healthy runners/PCs unaffected).

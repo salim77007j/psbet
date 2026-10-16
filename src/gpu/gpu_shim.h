@@ -1,6 +1,6 @@
 // ============================================================================
 //  PSBET — gpu_shim.h
-//  GPU device (software backend) + guest-facing submit interface.
+//  GPU device (backend driver) + guest-facing submit interface.
 // ============================================================================
 #pragma once
 
@@ -9,20 +9,28 @@
 #include "gpu/rasterizer.h"
 
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace psb::gpu {
 
 // ---------------------------------------------------------------------------
 // Device — owns a framebuffer + depth buffer and executes guest command
-// buffers on the software rasterizer. In Phase 2 this becomes the Vulkan
-// translation layer; the software backend remains as the reference device.
+// buffers on the active backend (software rasterizer or Vulkan). Parsing and
+// validation are shared; the backend only implements the drawing surface.
 // ---------------------------------------------------------------------------
 class Device {
 public:
     using FrameHook = std::function<void(u64 frameNumber)>;
 
+    // Software-backend constructor (compatibility; used by unit tests).
     Device(u8* colorBuf, float* depthBuf, u32 width, u32 height);
+
+    // Explicit-backend constructor (Vulkan device or any future backend).
+    Device(u8* colorBuf, u32 width, u32 height,
+           std::unique_ptr<IRasterBackend> backend);
+
+    ~Device();
 
     // Executes one display command buffer. Returns false on malformed input
     // (invalid opcodes/sizes) — the error is logged, execution stops.
@@ -41,13 +49,14 @@ public:
 
     u32 width() const { return width_; }
     u32 height() const { return height_; }
+    const char* backendName() const { return backendName_; }
 
 private:
     u8*    color_;
-    float* depth_;
     u32    width_;
     u32    height_;
-    Rasterizer raster_;
+    std::unique_ptr<IRasterBackend> backend_;
+    const char* backendName_ = "software";
 
     u64  frames_ = 0;
     u64  maxFrames_ = ~0ull;

@@ -1,6 +1,6 @@
 // ============================================================================
 //  PSBET — psbet_main.cpp
-//  CLI front-end: `psbet info <elf>` and `psbet run <elf> [options]`.
+//  CLI front-end: `psbet info <elf>`, `psbet gpu`, `psbet run <elf> [options]`.
 // ============================================================================
 #include <cstdio>
 #include <cstring>
@@ -11,12 +11,13 @@
 #include "core/log.h"
 #include "core/elf.h"
 #include "emulator.h"
+#include "gpu/vulkan_device.h"
 
 namespace {
 
 void printBanner() {
     std::printf(
-        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 1)\n"
+        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 2)\n"
         "Independent original software. No Sony code, keys or firmware.\n\n",
         psb::kVersionMajor, psb::kVersionMinor, psb::kVersionPatch);
 }
@@ -26,6 +27,8 @@ void printUsage() {
         "Usage:\n"
         "  psbet info <image.elf>\n"
         "      Parse and print an ELF image's program headers.\n\n"
+        "  psbet gpu\n"
+        "      Probe the host Vulkan stack (devices, driver versions).\n\n"
         "  psbet run <image.elf> [options]\n"
         "      Load and execute a guest image.\n"
         "Options:\n"
@@ -33,6 +36,7 @@ void printUsage() {
         "  --frames N                  Safety frame limit (default 1000000)\n"
         "  --screenshot-dir DIR        Capture PNG screenshots of the framebuffer\n"
         "  --screenshot-interval N     Capture every N frames (default 30)\n"
+        "  --backend NAME              auto | software | vulkan (default auto)\n"
         "  --verbose                   Debug logging + memory map dump\n");
 }
 
@@ -40,6 +44,13 @@ void printUsage() {
 
 int main(int argc, char** argv) {
     printBanner();
+
+    if (argc >= 2 && std::strcmp(argv[1], "gpu") == 0) {
+        std::fputs(psb::gpu::VulkanDevice::probeReport().c_str(), stdout);
+        std::fputc('\n', stdout);
+        return psb::gpu::VulkanDevice::available() ? 0 : 1;
+    }
+
     if (argc < 3) {
         printUsage();
         return 1;
@@ -73,6 +84,8 @@ int main(int argc, char** argv) {
                 opt.screenshotInterval = static_cast<psb::u32>(std::atoi(v));
             else if (std::strcmp(argv[i], "--screenshot-dir") == 0 && i + 1 < argc)
                 opt.screenshotDir = argv[++i];
+            else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc)
+                opt.backend = argv[++i];
             else if (std::strcmp(argv[i], "--verbose") == 0)
                 opt.verbose = true;
             else {
@@ -87,6 +100,7 @@ int main(int argc, char** argv) {
         const psb::EmuStats st = emu.run(path, opt);
 
         std::printf("\n=== PSBET run summary ===\n");
+        std::printf("  GPU backend     : %s\n", st.backendUsed.c_str());
         std::printf("  Guest exit code : %d%s\n", st.guestExitCode,
                     st.guestExitCode == 124 ? " (frame limit)" : "");
         std::printf("  Frames rendered : %llu\n", static_cast<unsigned long long>(st.frames));

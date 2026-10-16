@@ -44,12 +44,24 @@ public:
     void registerTlsModule(u32 id, const void* image, u64 memSize);
     void* tlsGetAddr(PsbTlsIndex* idx);
 
-    // --- Process exit (longjmp-based, CPU supervisor owns the jmp_buf) ----
-    void requestProcessExit(i32 exitCode);   // main thread only
+    // --- Process exit (thread-correct cooperative protocol) --------------
+    //
+    // Phase-1 flaw fixed: a worker thread calling ExitProcess used to longjmp
+    // on the MAIN thread's jmp_buf (cross-thread longjmp = UB). Protocol now:
+    //   * main thread (supervisor) calls it → same-thread longjmp, as before;
+    //   * a worker calls it → the exit is recorded and the worker unwinds its
+    //     OWN guest frames via its per-thread exit env (same path as
+    //     ExitThread), so it becomes joinable instead of parked forever;
+    //   * blocking kernel primitives wake when exit is requested, so a main
+    //     thread waiting on workers returns and finishes the exit;
+    //   * the supervisor reads the recorded code when guest execution ends.
+    void requestProcessExit(i32 exitCode);
     bool exitRequested() const;
     i32  exitCode() const;
 
-    // --- Thread cleanup at process end (detach stragglers) ----------------
+    // --- Thread cleanup at process end (cooperative) -----------------------
+    // Wakes everything blocked in kernel primitives, joins finished threads,
+    // and detaches only genuinely compute-bound stragglers (logged).
     void shutdownThreads();
 
     // --- Process start time (for GetProcessTime) --------------------------
@@ -86,6 +98,20 @@ void installThreadTls();
 // Process exit plumbing (used by CPU supervisor).
 void setProcessJmpBuf(void* env);   // opaque jmp_buf*
 void* processJmpBuf();
+
+// Marks the calling thread as the CPU supervisor for this guest run. Must be
+// set before guest entry and cleared after (RAII in runGuestEntry).
+void beginSupervisorScope();
+void endSupervisorScope();
+
+// True when called from the thread that owns the process jmp_buf (the CPU
+// supervisor's main thread). Workers get the cooperative path instead.
+bool isSupervisorThread();
+
+// Cooperative shutdown flag: kernel primitives wake on this (and on
+// exit-requested) so no guest thread is ever parked forever.
+void requestShutdown();
+bool shutdownRequested();
 
 } // namespace kernel
 } // namespace psb

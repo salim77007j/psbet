@@ -28,7 +28,12 @@ add_library(psbet_core STATIC
   src/core/kernel_shim.cpp
   src/core/cpu_supervisor.cpp
   src/gpu/png.cpp
+  src/gpu/spirv_emit.cpp
+  src/gpu/shader_cache.cpp
+  src/gpu/rdna.cpp
+  src/gpu/rdna_spirv.cpp
   src/gpu/rasterizer.cpp
+  src/gpu/vulkan_device.cpp
   src/gpu/gpu_shim.cpp
   src/emulator.cpp
 )
@@ -50,6 +55,9 @@ target_link_libraries(psbet PRIVATE psbet_core)
 # ---------------------------------------------------------------------------
 add_executable(psbet_tests tests/run_tests.cpp)
 target_link_libraries(psbet_tests PRIVATE psbet_core)
+
+add_executable(psbet_rdna_tests tests/rdna_tests.cpp)
+target_link_libraries(psbet_rdna_tests PRIVATE psbet_core)
 
 # ---------------------------------------------------------------------------
 # Guest test homebrew (ELF images for the loader to execute).
@@ -73,6 +81,14 @@ if(NOT MSVC AND NOT WIN32)
     OUTPUT_NAME "hello" PREFIX "" SUFFIX ".elf"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+  add_library(hb_worker_exit SHARED tests/homebrew/worker_exit.c)
+  target_include_directories(hb_worker_exit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_worker_exit PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_worker_exit PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_worker_exit PROPERTIES
+    OUTPUT_NAME "worker_exit" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
   add_library(hb_cube SHARED tests/homebrew/cube.c)
   target_include_directories(hb_cube PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_options(hb_cube PRIVATE ${GUEST_CFLAGS})
@@ -87,3 +103,4 @@ endif()
 # ---------------------------------------------------------------------------
 enable_testing()
 add_test(NAME unit_tests COMMAND psbet_tests)
+add_test(NAME rdna_tests COMMAND psbet_rdna_tests)
