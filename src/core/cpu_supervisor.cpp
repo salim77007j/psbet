@@ -32,7 +32,7 @@ namespace psb::cpu {
 
 namespace {
 
-jmp_buf     g_returnEnv;
+[[maybe_unused]] jmp_buf g_returnEnv; // legacy: kept for reference (Ctx owns the live env now)
 std::string* g_reportSink = nullptr;
 u64         g_modBase = 0;
 u64         g_modSize = 0;
@@ -127,10 +127,24 @@ void installCrashDiagnostics(std::string* reportSink, u64 moduleBase, u64 module
 }
 
 GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {
-    GuestRunResult result;
+    // MSVC constraint: a frame that calls setjmp must not own C++ objects
+    // with destructors — longjmp out of such a frame raises
+    // STATUS_INVALID_DISPATCH (0xC00000FF). The result therefore lives on
+    // the heap and the frame below holds only POD members.
+    struct Ctx {
+        jmp_buf                 env;
+        kernel::KernelState*    ks;
+        GuestRunResult*         result;   // heap-owned; string accessed via pointer
+        const LoadedModule*     mod;
+    };
+    Ctx ctx{};
+    ctx.ks = &kernelState;
+    ctx.mod = &mod;
+    auto* result = new GuestRunResult();
+    ctx.result = result;
 
-    installCrashDiagnostics(&result.crashReport, mod.base, mod.imageSize);
-    kernel::setProcessJmpBuf(&g_returnEnv);
+    installCrashDiagnostics(&result->crashReport, mod.base, mod.imageSize);
+    kernel::setProcessJmpBuf(&ctx.env);
 
     // Mark this thread as the supervisor for the exit protocol (flaw fix:
     // worker threads must never longjmp on this thread's env).
@@ -139,21 +153,24 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
     // Install main-thread TLS for module 1 before any guest code runs.
     kernel::installThreadTls();
 
-    if (setjmp(g_returnEnv) == 0) {
+    if (setjmp(ctx.env) == 0) {
         using GuestEntry = void (*)();
         reinterpret_cast<GuestEntry>(mod.entry)();
         // Guest entry returned without calling ExitProcess: treat as code 0.
-        result.exitCode = 0;
-        result.exitedViaGuest = true;
+        result->exitCode = 0;
+        result->exitedViaGuest = true;
     } else {
-        result.exitCode = kernelState.exitCode();
-        result.exitedViaGuest = true;
-        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result.exitCode);
+        result->exitCode = kernelState.exitCode();
+        result->exitedViaGuest = true;
+        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result->exitCode);
     }
 
     kernel::setProcessJmpBuf(nullptr);
     kernel::endSupervisorScope();
-    return result;
+
+    GuestRunResult out = std::move(*result);
+    delete result;
+    return out;
 }
 
 } // namespace psb::cpu
