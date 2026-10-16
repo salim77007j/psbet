@@ -272,7 +272,8 @@ RecompileResult recompile(const u32* code, u32 codeWords, Stage stage) {
     }
 
     // ---- pass 2: emit ---------------------------------------------------------------
-    m.beginFunction(voidT, {});
+    const spv::Word entryId = m.id();
+    m.beginFunction(voidT, {}, entryId);
     m.functionParams();
     m.beginBlock();
 
@@ -673,7 +674,6 @@ RecompileResult recompile(const u32* code, u32 codeWords, Stage stage) {
     }
 
     // ---- entry point (emitted last: complete interface list) ---------------------
-    const spv::Word entryId = m.id();
     m.entryPoint(stage == Stage::Vertex ? spv::ExecModel::Vertex : spv::ExecModel::Fragment,
                  entryId, "psb_main", interface);
     if (stage == Stage::Fragment)

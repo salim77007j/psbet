@@ -225,11 +225,12 @@ Word Module::globalVariable(Word resultType, Storage storage, const char* dbgNam
 
 // --- functions -------------------------------------------------------------------------
 
-void Module::beginFunction(Word resultType, const std::vector<Word>& paramTypes) {
+void Module::beginFunction(Word resultType, const std::vector<Word>& paramTypes,
+                           Word explicitId) {
     current_ = FnCtx{};
     current_.retType = resultType;
     current_.paramTypes = paramTypes;
-    current_.fnId = id();
+    current_.fnId = explicitId ? explicitId : id();
 
     const Word fnType = typeFunction(resultType, paramTypes);
     // OpFunction: ResultType Result Control FunctionType
@@ -384,9 +385,7 @@ SpirvShaders buildPipelineShaders() {
         m.decorateLocation(outColor, 1);
 
         const Word vsMain = m.id();
-        m.entryPoint(ExecModel::Vertex, vsMain, "psb_vs", {inPos, inColor, outPos, outColor});
-
-        m.beginFunction(voidT, {});
+        m.beginFunction(voidT, {}, vsMain);
         m.functionParams();
         m.beginBlock();
         const Word p = m.emit(Op::Load, v4f, {inPos});
@@ -404,6 +403,9 @@ SpirvShaders buildPipelineShaders() {
         m.emitVoid(Op::Store, {outPos, pos2});
         m.emitVoid(Op::Store, {outColor, c});
         m.endFunction();
+
+        m.entryPoint(ExecModel::Vertex, vsMain, "psb_vs",
+                     {inPos, inColor, outPos, outColor});
 
         out.vertex = m.finalize();
     }
@@ -425,15 +427,15 @@ SpirvShaders buildPipelineShaders() {
         m.decorateLocation(outColor, 0);
 
         const Word fsMain = m.id();
-        m.entryPoint(ExecModel::Fragment, fsMain, "psb_fs", {inColor, outColor});
-        m.executionMode(fsMain, ExeMode::OriginUpperLeft);
-
-        m.beginFunction(voidT, {});
+        m.beginFunction(voidT, {}, fsMain);
         m.functionParams();
         m.beginBlock();
         const Word c = m.emit(Op::Load, v4f, {inColor});
         m.emitVoid(Op::Store, {outColor, c});
         m.endFunction();
+
+        m.entryPoint(ExecModel::Fragment, fsMain, "psb_fs", {inColor, outColor});
+        m.executionMode(fsMain, ExeMode::OriginUpperLeft);
 
         out.fragment = m.finalize();
     }

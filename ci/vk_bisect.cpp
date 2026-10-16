@@ -29,8 +29,12 @@ static void segvHandler(int sig, siginfo_t* info, void*) {
 static std::vector<Word> readSpv(const char* path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::printf("cannot open %s\n", path); exit(2); }
-    return std::vector<Word>((std::istreambuf_iterator<char>(f)),
-                             std::istreambuf_iterator<char>());
+    // Read BYTES, then pack 4 bytes little-endian per word.
+    std::vector<char> bytes((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    std::vector<Word> words(bytes.size() / 4);
+    std::memcpy(words.data(), bytes.data(), words.size() * 4);
+    return words;
 }
 
 int main(int argc, char** argv) {

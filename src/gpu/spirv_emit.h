@@ -198,7 +198,9 @@ namespace ExeMode {
 }
 
 namespace MemModel {
-    constexpr Word Logical  = 1;
+    // SPIR-V spec: AddressingModel Logical = 0 (Physical32 = 1 — the value
+    // Phase-2 debugging proved breaks every real driver's pipeline compile).
+    constexpr Word Logical  = 0;
     constexpr Word GLSL450  = 1;
 }
 
@@ -255,7 +257,11 @@ public:
     Word globalVariable(Word resultType, Storage storage, const char* dbgName = nullptr);
 
     // --- functions -----------------------------------------------------------------------
-    void beginFunction(Word resultType, const std::vector<Word>& paramTypes);
+    // explicitId: use a pre-allocated <id> for the function (REQUIRED when an
+    // OpEntryPoint will reference it — entry point and function ids must be
+    // the same <id>, otherwise the module is invalid).
+    void beginFunction(Word resultType, const std::vector<Word>& paramTypes,
+                       Word explicitId = 0);
     std::vector<Word> functionParams();   // call once, before first block
     Word beginBlock();                    // emits OpLabel; returns label id
     void beginBlockAt(Word lbl);          // emits OpLabel for a pre-allocated id
