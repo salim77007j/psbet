@@ -144,6 +144,7 @@ jobs:
 
       - name: Run hello.elf on Windows
         working-directory: build
+        timeout-minutes: 5
         run: |
           Release\psbet.exe run ..\guests\hello.elf
           echo "exit: $LASTEXITCODE"
@@ -151,6 +152,7 @@ jobs:
 
       - name: Run worker_exit.elf on Windows (cooperative exit regression)
         working-directory: build
+        timeout-minutes: 5
         run: |
           Release\psbet.exe run ..\guests\worker_exit.elf
           echo "exit: $LASTEXITCODE"
@@ -158,13 +160,14 @@ jobs:
 
       - name: Run cube.elf on Windows + screenshots
         working-directory: build
+        timeout-minutes: 5
         shell: pwsh
         run: |
           $p = Start-Process -FilePath "Release\psbet.exe" `
             -ArgumentList "run","..\guests\cube.elf","--frames","90",`
                           "--screenshot-dir","..\shots-win","--screenshot-interval","30" `
             -PassThru -NoNewWindow
-          $p.WaitForExit()
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); exit 124 }
           echo "exit: $($p.ExitCode)"
           if ($p.ExitCode -ne 124) { exit $p.ExitCode }
           Get-ChildItem ..\shots-win

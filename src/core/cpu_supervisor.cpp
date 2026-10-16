@@ -168,12 +168,18 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
     if (guestDone && !kernelState.exitRequested()) {
         result.exitCode = 0;
         result.exitedViaGuest = true;
+        guest.join();      // natural completion — safe to join
+        LOG_INFO("CPU: guest entry returned (code 0)");
     } else {
         result.exitCode = kernelState.exitCode();
         result.exitedViaGuest = true;
         LOG_INFO("CPU: guest exit signaled (code %d)", result.exitCode);
+        // The guest thread is parked inside the exit path (it must never
+        // unwind guest frames under MSVC SEH) — join() would deadlock.
+        // Detach it; the process is exiting and shutdownThreads detaches
+        // every parked guest thread.
+        guest.detach();
     }
-    guest.join();          // joinable: ExitProcess path parks, never runs away
     kernel::endSupervisorScope();
     return result;
 }
