@@ -212,13 +212,14 @@ Word Module::constVec2F32(float x, float y) {
 
 // --- globals -------------------------------------------------------------------------
 
-Word Module::globalVariable(Word resultType, Storage storage, const char* dbgName) {
-    std::vector<Word> ops{resultType, 0 /*result patched below*/};
-    // Variable: ResultType Result StorageClass — emit manually for the id.
-    Word res = id();
-    ops[1] = res;
-    ops.push_back(static_cast<Word>(storage));
-    pushInst(secGlobals_, Op::Variable, ops);
+Word Module::globalVariable(Word pointeeType, Storage storage, const char* dbgName) {
+    // SPIR-V: OpVariable's Result Type must be a POINTER to the pointee.
+    // Callers pass the pointee; the pointer type is created here so loads
+    // keep using the pointee as their result type.
+    const Word ptrT = typePointer(storage, pointeeType);
+    const Word res = id();
+    pushInst(secGlobals_, Op::Variable,
+             {ptrT, res, static_cast<Word>(storage)});
     if (dbgName) name(res, dbgName);
     return res;
 }

@@ -117,7 +117,7 @@ RecompileResult recompile(const u32* code, u32 codeWords, Stage stage) {
     spv::Word ssboVar = 0;
     auto ensureSsbo = [&]() -> spv::Word {
         if (!ssboVar) {
-            ssboVar = m.globalVariable(ssboPtrT, spv::Storage::StorageBuffer);
+            ssboVar = m.globalVariable(ssboStruct, spv::Storage::StorageBuffer);
             m.name(ssboVar, "psb_smem");
             m.decorateDescriptor(ssboVar, 0, 0);
             interface.push_back(ssboVar);
@@ -546,8 +546,7 @@ RecompileResult recompile(const u32* code, u32 codeWords, Stage stage) {
                 } else {
                     const spv::Word imgT = m.typeImage(f32T);
                     const spv::Word siT = m.typeSampledImage(imgT);
-                    const spv::Word pT = m.typePointer(spv::Storage::UniformConstant, siT);
-                    svar = m.globalVariable(pT, spv::Storage::UniformConstant);
+                    svar = m.globalVariable(siT, spv::Storage::UniformConstant);
                     char nm[32];
                     std::snprintf(nm, sizeof(nm), "tex%u", slot);
                     m.name(svar, nm);

@@ -894,6 +894,11 @@ bool VulkanDevice::available() {
 
 bool VulkanDevice::selfTest() {
 #if !defined(_WIN32)
+    // Debug escape hatch: PSBET_VK_NO_GUARD=1 lets a driver fault crash
+    // loudly (with a backtrace) instead of being contained.
+    if (const char* ng = std::getenv("PSBET_VK_NO_GUARD"); ng && ng[0] == '1')
+        return selfTestImpl();
+
     // The self-test must survive a driver fault (e.g. a broken JIT segfaults
     // inside vkCreateGraphicsPipelines). Guard with a restore-on-exit sigjmp.
     static sigjmp_buf stEnv;

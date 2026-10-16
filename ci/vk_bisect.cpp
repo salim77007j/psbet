@@ -240,6 +240,13 @@ int main(int argc, char** argv) {
     VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     if (dynIdx) { dyn.dynamicStateCount = 2; dyn.pDynamicStates = dynStates; }
 
+    // Depth-enable override for the DS state (engine self-test draws with
+    // depth disabled while the renderpass has a depth attachment).
+    if (argc > 3 && argv[3][0] == 'd') {
+        ds.depthTestEnable = static_cast<VkBool32>(std::atoi(&argv[3][1]));
+        ds.depthWriteEnable = ds.depthTestEnable;
+    }
+
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pi.stageCount = 2;
     pi.pStages = stages;
@@ -254,6 +261,10 @@ int main(int argc, char** argv) {
     pi.layout = layout;
     pi.renderPass = rp;
     pi.subpass = 0;
+
+    // Depth-enable axis: argv[2]=="9" + argv[3]=="d<0|1>" overrides the DS
+    // state's depthTestEnable (engine's self-test uses depth disabled).
+    // (Parsed after ds is built — see below.)
 
     // Probe mode: argv[3]=="p" varies pipeline-shape hypotheses that all use
     // the depth renderpass (rp 0) and the passthrough shader.
@@ -286,6 +297,183 @@ int main(int argc, char** argv) {
     }
 
     VkPipeline pipe = VK_NULL_HANDLE;
+    // Full-render mode: argv[3]=="r" — after pipeline creation, perform the
+    // complete offscreen render (images, framebuffer, draw, submit, readback)
+    // exactly like the engine does. Isolates submit-time shader crashes.
+    if (probe && probe[0] == 'r') {
+        auto CIMG = reinterpret_cast<PFN_vkCreateImage>(gipa(inst, "vkCreateImage"));
+        auto CBUFF = reinterpret_cast<PFN_vkCreateBuffer>(gipa(inst, "vkCreateBuffer"));
+        auto ALLOC = reinterpret_cast<PFN_vkAllocateMemory>(gipa(inst, "vkAllocateMemory"));
+        auto BINDI = reinterpret_cast<PFN_vkBindImageMemory>(gipa(inst, "vkBindImageMemory"));
+        auto BINDB = reinterpret_cast<PFN_vkBindBufferMemory>(gipa(inst, "vkBindBufferMemory"));
+        auto GIMR = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gipa(inst, "vkGetImageMemoryRequirements"));
+        auto GBMR = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(gipa(inst, "vkGetBufferMemoryRequirements"));
+        auto GMP = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(gipa(inst, "vkGetPhysicalDeviceMemoryProperties"));
+        auto MAP = reinterpret_cast<PFN_vkMapMemory>(gipa(inst, "vkMapMemory"));
+        auto CP = reinterpret_cast<PFN_vkCreateCommandPool>(gipa(inst, "vkCreateCommandPool"));
+        auto ACB = reinterpret_cast<PFN_vkAllocateCommandBuffers>(gipa(inst, "vkAllocateCommandBuffers"));
+        auto CF = reinterpret_cast<PFN_vkCreateFence>(gipa(inst, "vkCreateFence"));
+        auto WF = reinterpret_cast<PFN_vkWaitForFences>(gipa(inst, "vkWaitForFences"));
+        auto RF = reinterpret_cast<PFN_vkResetFences>(gipa(inst, "vkResetFences"));
+        auto QSUB = reinterpret_cast<PFN_vkQueueSubmit>(gipa(inst, "vkQueueSubmit"));
+        auto GDQ = reinterpret_cast<PFN_vkGetDeviceQueue>(gipa(inst, "vkGetDeviceQueue"));
+        auto CV = reinterpret_cast<PFN_vkCreateImageView>(gipa(inst, "vkCreateImageView"));
+        auto CFB = reinterpret_cast<PFN_vkCreateFramebuffer>(gipa(inst, "vkCreateFramebuffer"));
+        VkPhysicalDeviceMemoryProperties mp{};
+        reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(gipa(inst, "vkGetPhysicalDeviceMemoryProperties"))(phys, &mp);
+
+        VkQueue queue; GDQ(dev, gfx, 0, &queue);
+        const VkDeviceSize imgSize = 64ull * 64ull * 4ull;
+
+        auto makeImg = [&](VkFormat fmt, VkImageUsageFlags usage) {
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D;
+            ii.format = fmt;
+            ii.extent = {64, 64, 1};
+            ii.mipLevels = 1; ii.arrayLayers = 1;
+            ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = usage;
+            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImage img; VkDeviceMemory mem;
+            if (CIMG(dev, &ii, nullptr, &img) != VK_SUCCESS) return std::pair<VkImage, VkDeviceMemory>{};
+            VkMemoryRequirements mr; GIMR(dev, img, &mr);
+            uint32_t mt = 0;
+            for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+                if (mr.memoryTypeBits & (1u << i)) { mt = i; break; }
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+            ALLOC(dev, &mai, nullptr, &mem);
+            BINDI(dev, img, mem, 0);
+            return std::pair<VkImage, VkDeviceMemory>{img, mem};
+        };
+
+        auto color = makeImg(VK_FORMAT_R8G8B8A8_UNORM,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        auto depth = makeImg(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        auto readback = makeImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        std::printf("  images created\n");
+
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vi.image = color.first;
+        VkImageView colView; CV(dev, &vi, nullptr, &colView);
+        vi.format = VK_FORMAT_D32_SFLOAT;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vi.image = depth.first;
+        VkImageView depView; CV(dev, &vi, nullptr, &depView);
+        VkImageView atts[2] = {colView, depView};
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = rp; fi.attachmentCount = 2; fi.pAttachments = atts;
+        fi.width = 64; fi.height = 64; fi.layers = 1;
+        VkFramebuffer fb;
+        if (CFB(dev, &fi, nullptr, &fb) != VK_SUCCESS) { std::printf("fb fail\n"); return 1; }
+        std::printf("  framebuffer created\n");
+
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = 4096; bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        VkBuffer vbuf;
+        if (CBUFF(dev, &bci, nullptr, &vbuf) != VK_SUCCESS) { std::printf("buf fail\n"); return 1; }
+        VkMemoryRequirements mr; GBMR(dev, vbuf, &mr);
+        uint32_t mt = 0;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+            if ((mr.memoryTypeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                { mt = i; break; }
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+        VkDeviceMemory vmem;
+        ALLOC(dev, &mai, nullptr, &vmem);
+        BINDB(dev, vbuf, vmem, 0);
+        void* vptr = nullptr;
+        MAP(dev, vmem, 0, VK_WHOLE_SIZE, 0, &vptr);
+        const float verts[6][8] = {
+            {-0.5f,-0.5f,0.5f,1, 1,0,0,1}, {0.5f,-0.5f,0.5f,1, 0,1,0,1}, {0,0.5f,0.5f,1, 0,0,1,1},
+        };
+        std::memcpy(vptr, verts, sizeof(verts));
+        std::printf("  vertex buffer created+mapped\n");
+
+        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cpi.queueFamilyIndex = gfx;
+        VkCommandPool pool; CP(dev, &cpi, nullptr, &pool);
+        VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbi.commandPool = pool; cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbi.commandBufferCount = 1;
+        VkCommandBuffer cb; ACB(dev, &cbi, &cb);
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence; CF(dev, &fci, nullptr, &fence);
+        std::printf("  command infrastructure ready\n");
+        if (CGP(dev, nullptr, 1, &pi, nullptr, &pipe) != VK_SUCCESS) {
+            std::printf("  pipeline create fail\n");
+            return 1;
+        }
+        std::printf("  pipeline created\n");
+
+        auto GQ = reinterpret_cast<PFN_vkGetDeviceQueue>(gipa(inst, "vkGetDeviceQueue"));
+        (void)GQ;
+        auto Begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(gipa(inst, "vkBeginCommandBuffer"));
+        auto End = reinterpret_cast<PFN_vkEndCommandBuffer>(gipa(inst, "vkEndCommandBuffer"));
+        auto BRP = reinterpret_cast<PFN_vkCmdBeginRenderPass>(gipa(inst, "vkCmdBeginRenderPass"));
+        auto ERP = reinterpret_cast<PFN_vkCmdEndRenderPass>(gipa(inst, "vkCmdEndRenderPass"));
+        auto SVP = reinterpret_cast<PFN_vkCmdSetViewport>(gipa(inst, "vkCmdSetViewport"));
+        auto SSC = reinterpret_cast<PFN_vkCmdSetScissor>(gipa(inst, "vkCmdSetScissor"));
+        auto BP = reinterpret_cast<PFN_vkCmdBindPipeline>(gipa(inst, "vkCmdBindPipeline"));
+        auto BV = reinterpret_cast<PFN_vkCmdBindVertexBuffers>(gipa(inst, "vkCmdBindVertexBuffers"));
+        auto DR = reinterpret_cast<PFN_vkCmdDraw>(gipa(inst, "vkCmdDraw"));
+        auto CPY = reinterpret_cast<PFN_vkCmdCopyImage>(gipa(inst, "vkCmdCopyImage"));
+        auto BAR = reinterpret_cast<PFN_vkCmdPipelineBarrier>(gipa(inst, "vkCmdPipelineBarrier"));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (Begin(cb, &bi) != VK_SUCCESS) { std::printf("begin fail\n"); return 1; }
+        VkClearValue cv[2]{};
+        cv[0].color = {{0.f, 0.f, 0.f, 1.f}};
+        cv[1].depthStencil = {1.f, 0};
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = rp; rbi.framebuffer = fb;
+        rbi.renderArea = {{0, 0}, {64, 64}};
+        rbi.clearValueCount = 2; rbi.pClearValues = cv;
+        BRP(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        const VkViewport vp{0.f, 0.f, 64.f, 64.f, 0.f, 1.f};
+        const VkRect2D sc{{0, 0}, {64, 64}};
+        SVP(cb, 0, 1, &vp);
+        SSC(cb, 0, 1, &sc);
+        BP(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        VkDeviceSize off = 0;
+        BV(cb, 0, 1, &vbuf, &off);
+        DR(cb, 3, 1, 0, 0);
+        ERP(cb);
+        VkImageMemoryBarrier rb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        rb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        rb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.image = readback.first;
+        rb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        BAR(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &rb);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {64, 64, 1};
+        CPY(cb, color.first, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            readback.first, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        if (End(cb) != VK_SUCCESS) { std::printf("end fail\n"); return 1; }
+        std::printf("  command buffer recorded, submitting...\n");
+
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        const VkResult sub = QSUB(queue, 1, &si, fence);
+        std::printf("  submit -> %d\n", (int)sub);
+        if (sub == VK_SUCCESS)
+            std::printf("  wait -> %d\n",
+                        (int)WF(dev, 1, &fence, VK_TRUE, 10ull * 1000ull * 1000ull * 1000ull));
+        std::printf("FULL RENDER DONE\n");
+        return 0;
+    }
+
     const VkResult r = CGP(dev, nullptr, 1, &pi, nullptr, &pipe);
     std::printf("combo %d dcfg=%d (vs=%s rp=%s dyn=%d) -> VkResult %d %s\n", combo, dCfg,
                 vsPaths[vIdx] ? vsPaths[vIdx] : "garbage",
