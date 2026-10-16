@@ -172,6 +172,34 @@ The pixel-compare acceptance criterion — "cube demo renders identically
 through Vulkan and software backends" — is met with a 100% agreement rate at
 tolerance ±4/255 per channel.
 
+### 3.6 Windows guest execution — the ABI discovery
+
+First Windows guest runs failed in ways that looked random (illegal
+instructions, dispatch failures, then hangs). Systematic CI-driven diagnosis
+established the actual root cause and fixed it:
+
+1. `STATUS_INVALID_DISPATCH (0xC00000FF)`: MSVC's longjmp cannot unwind
+   through GCC-compiled guest frames. **Fix**: a fully longjmp-free Windows
+   hosting model — the guest runs on a dedicated thread; every
+   guest-initiated exit records the code, signals the supervisor and parks
+   the calling thread (detached at shutdown; the process is exiting).
+2. **The x64 ABI mismatch (the deep one): PS5-class guests pass arguments in
+   SysV registers (RDI, RSI, RDX, RCX...) while the MSVC host reads Win64
+   order (RCX, RDX, R8, R9...). Every multi-argument guest→host call
+   received garbage** — observed directly as `mutex '' created` (the name
+   argument read from the wrong register). **Fix**: `w64_thunks.asm` —
+   per-arity MASM trampolines (0–6 args) that shuffle registers, reserve the
+   Win64 shadow space, shift stack arguments and forward to host forwarders;
+   the kernel + GPU export tables bind through the thunks on MSVC.
+
+After the trampolines, guests on Windows demonstrably: load, bind kernel
+imports **by correct name** (`mutex 'shared' created`, `semaphore
+'handshake' created`), print through `sceKernelWrite`, and spawn/run worker
+threads. A residual corruption in TLS-backed value paths (garbled counters
+→ stack scribble → AV at exit) remains open and is tracked for Phase 3,
+where the Windows ABI surface gets its own conformance suite. The CI keeps
+these steps as gated diagnostics; the Windows core suite is the hard gate.
+
 ## 4. Flaw ledger (the six)
 
 | # | Flaw (Phase-1 report) | Resolution |
@@ -180,7 +208,7 @@ tolerance ±4/255 per channel.
 | 2 | Guest threads detached at exit | **Fixed**: cooperative termination — primitives wake, finished threads join, only compute-bound stragglers detach (logged) |
 | 3 | `longjmp` exit skips C++ destructors | **Mitigated**: workers no longer longjmp through guest frames at all; the supervisor's same-thread longjmp remains (shim-only frames, ASan-verified leak-free); full unwinding-aware teardown stays on the Phase-3 roadmap |
 | 4 | Guest stdout / engine stderr interleave | **Fixed**: shared console mutex + flush ordering |
-| 5 | Windows: no guest execution | **Fixed**: SEH vectored crash diagnostics, Win32 I/O in the kernel shim, CI job executing `hello.elf` / `worker_exit.elf` / `cube.elf` on `windows-latest` |
+| 5 | Windows: no guest execution | **Substantially delivered** (see §3.6): SEH crash diagnostics, Win32 I/O, longjmp-free hosting model, and SysV→Win64 ABI trampolines; guests now load, bind kernel imports by name, print, create kernel objects and spawn workers on `windows-latest`. A residual value-corruption in TLS/printf paths remains — CI runs the Windows guest steps as gated diagnostics and tracks the issue for Phase 3 |
 | 6 | GPU: software rasterizer only | **Delivered**: Vulkan backend + RDNA subset + SPIR-V recompiler + shader/pipeline caches + pixel-compare harness (this phase's headline) |
 
 ## 5. CI (GitHub Actions)
