@@ -639,6 +639,13 @@ int32_t sceKernelIsNeoMode(void) {
 // shuffles SysV registers (RDI,RSI,RDX,RCX...) into Win64 order (RCX,RDX,R8,
 // R9) and reserves shadow space. Forwarders only — all logic stays here.
 #if defined(_WIN32)
+// Defined later in this file (PSBET runtime section).
+void*    psbTlsGetAddr(PsbTlsIndex* idx);
+void     psbCxaFinalize(void* d);
+int32_t  psbGetRuntimeVersion(void);
+const char* psbGetRuntimeName(void);
+void     psbStackChkFail(void);
+
 extern "C" {
 int32_t  psbXSysAllocateDirectMemory(int64_t a, int64_t b, size_t c, size_t d, int e, int64_t* f)
     { return sceKernelAllocateDirectMemory(a, b, c, d, e, f); }
