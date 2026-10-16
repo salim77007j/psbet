@@ -634,6 +634,83 @@ int32_t sceKernelIsNeoMode(void) {
     return 0; // base model
 }
 
+// ---- Windows ABI trampoline targets ---------------------------------------
+// Guests call these through SysV->Win64 thunks (w64_thunks.asm): the thunk
+// shuffles SysV registers (RDI,RSI,RDX,RCX...) into Win64 order (RCX,RDX,R8,
+// R9) and reserves shadow space. Forwarders only — all logic stays here.
+#if defined(_WIN32)
+extern "C" {
+int32_t  psbXSysAllocateDirectMemory(int64_t a, int64_t b, size_t c, size_t d, int e, int64_t* f)
+    { return sceKernelAllocateDirectMemory(a, b, c, d, e, f); }
+int32_t  psbXSysMapDirectMemory(void** a, size_t b, int c, int d, int64_t e, size_t f)
+    { return sceKernelMapDirectMemory(a, b, c, d, e, f); }
+int32_t  psbXSysGetDirectMemorySize(size_t* a)
+    { return sceKernelGetDirectMemorySize(a); }
+uint64_t psbXSysGetProcessTime(void)
+    { return sceKernelGetProcessTime(); }
+uint64_t psbXSysGetProcessTimeInTick(void)
+    { return sceKernelGetProcessTimeInTick(); }
+int32_t  psbXSysUsleep(uint64_t a)
+    { return sceKernelUsleep(a); }
+int32_t  psbXSysNanosleep(uint64_t a, uint64_t b)
+    { return sceKernelNanosleep(a, b); }
+int32_t  psbXSysSleep(uint64_t a)
+    { return sceKernelSleep(a); }
+int32_t  psbXSysCreateThread(const char* a, void* b, int32_t c, size_t d, uint64_t e, uint64_t f, int32_t* g)
+    { return sceKernelCreateThread(a, b, c, d, e, f, g); }
+int32_t  psbXSysStartThread(int32_t a, size_t b, void* c)
+    { return sceKernelStartThread(a, b, c); }
+int32_t  psbXSysWaitThreadEnd(int32_t a, int32_t* b, uint64_t* c)
+    { return sceKernelWaitThreadEnd(a, b, c); }
+void     psbXSysExitThread(int32_t a)
+    { sceKernelExitThread(a); }
+void     psbXSysExitProcess(int32_t a)
+    { sceKernelExitProcess(a); }
+int32_t  psbXSysGetThreadId(void)
+    { return sceKernelGetThreadId(); }
+int32_t  psbXSysCreateMutex(const char* a, uint32_t b, int32_t c, int32_t* d)
+    { return sceKernelCreateMutex(a, b, c, d); }
+int32_t  psbXSysLockMutex(int32_t a, uint64_t b)
+    { return sceKernelLockMutex(a, b); }
+int32_t  psbXSysUnlockMutex(int32_t a)
+    { return sceKernelUnlockMutex(a); }
+int32_t  psbXSysCreateSemaphore(const char* a, int32_t b, int32_t c, int32_t* d)
+    { return sceKernelCreateSemaphore(a, b, c, d); }
+int32_t  psbXSysWaitSemaphore(int32_t a, int32_t b, uint64_t c)
+    { return sceKernelWaitSemaphore(a, b, c); }
+int32_t  psbXSysSignalSemaphore(int32_t a, int32_t b)
+    { return sceKernelSignalSemaphore(a, b); }
+int32_t  psbXSysCreateCond(const char* a, uint32_t b, int32_t* c)
+    { return sceKernelCreateCond(a, b, c); }
+int32_t  psbXSysWaitCond(int32_t a, int32_t b, uint64_t c)
+    { return sceKernelWaitCond(a, b, c); }
+int32_t  psbXSysSignalCond(int32_t a)
+    { return sceKernelSignalCond(a); }
+int32_t  psbXSysSignalCondAll(int32_t a)
+    { return sceKernelSignalCondAll(a); }
+int64_t  psbXSysWrite(int32_t a, const void* b, size_t c)
+    { return sceKernelWrite(a, b, c); }
+int64_t  psbXSysRead(int32_t a, void* b, size_t c)
+    { return sceKernelRead(a, b, c); }
+int32_t  psbXSysOpen(const char* a, int32_t b, uint32_t c)
+    { return sceKernelOpen(a, b, c); }
+int32_t  psbXSysClose(int32_t a)
+    { return sceKernelClose(a); }
+int32_t  psbXSysIsNeoMode(void)
+    { return sceKernelIsNeoMode(); }
+void*    psbXTlsGetAddr(PsbTlsIndex* a)
+    { return psbTlsGetAddr(a); }
+void     psbXCxaFinalize(void* a)
+    { psbCxaFinalize(a); }
+int32_t  psbXGetRuntimeVersion(void)
+    { return psbGetRuntimeVersion(); }
+const char* psbXGetRuntimeName(void)
+    { return psbGetRuntimeName(); }
+void     psbXStackChkFail(void)
+    { psbStackChkFail(); }
+} // extern "C"
+#endif // _WIN32
+
 // ---- PSBET runtime --------------------------------------------------------
 // NOTE: implementations are deliberately NOT named __tls_get_addr /
 // __cxa_finalize in the host symbol table — defining those symbols would
@@ -674,6 +751,68 @@ namespace {
 
 struct Export { const char* name; void* fn; };
 
+#if defined(_WIN32)
+// Windows: guests speak SysV; the MASM thunks (w64_thunks.asm) shuffle into
+// Win64 and forward to the psbX* forwarders above.
+extern "C" {
+void psbTWinAllocateDirectMemory(void);  void psbTWinMapDirectMemory(void);
+void psbTWinGetDirectMemorySize(void);   void psbTWinGetProcessTime(void);
+void psbTWinGetProcessTimeInTick(void);  void psbTWinUsleep(void);
+void psbTWinNanosleep(void);             void psbTWinSleep(void);
+void psbTWinCreateThread(void);          void psbTWinStartThread(void);
+void psbTWinWaitThreadEnd(void);         void psbTWinExitThread(void);
+void psbTWinExitProcess(void);           void psbTWinGetThreadId(void);
+void psbTWinCreateMutex(void);           void psbTWinLockMutex(void);
+void psbTWinUnlockMutex(void);           void psbTWinCreateSemaphore(void);
+void psbTWinWaitSemaphore(void);         void psbTWinSignalSemaphore(void);
+void psbTWinCreateCond(void);            void psbTWinWaitCond(void);
+void psbTWinSignalCond(void);            void psbTWinSignalCondAll(void);
+void psbTWinWrite(void);                 void psbTWinRead(void);
+void psbTWinOpen(void);                  void psbTWinClose(void);
+void psbTWinIsNeoMode(void);             void psbTWinTlsGetAddr(void);
+void psbTWinCxaFinalize(void);           void psbTWinGetRuntimeVersion(void);
+void psbTWinGetRuntimeName(void);        void psbTWinGnmSubmit(void);
+void psbTWinStackChkFail(void);
+}
+#define W(name) psbTWin##name
+const Export kExports[] = {
+    {"sceKernelAllocateDirectMemory", (void*)&W(AllocateDirectMemory)},
+    {"sceKernelMapDirectMemory",      (void*)&W(MapDirectMemory)},
+    {"sceKernelGetDirectMemorySize",  (void*)&W(GetDirectMemorySize)},
+    {"sceKernelGetProcessTime",       (void*)&W(GetProcessTime)},
+    {"sceKernelGetProcessTimeInTick", (void*)&W(GetProcessTimeInTick)},
+    {"sceKernelUsleep",               (void*)&W(Usleep)},
+    {"sceKernelNanosleep",            (void*)&W(Nanosleep)},
+    {"sceKernelSleep",                (void*)&W(Sleep)},
+    {"sceKernelCreateThread",         (void*)&W(CreateThread)},
+    {"sceKernelStartThread",          (void*)&W(StartThread)},
+    {"sceKernelWaitThreadEnd",        (void*)&W(WaitThreadEnd)},
+    {"sceKernelExitThread",           (void*)&W(ExitThread)},
+    {"sceKernelExitProcess",          (void*)&W(ExitProcess)},
+    {"sceKernelGetThreadId",          (void*)&W(GetThreadId)},
+    {"sceKernelCreateMutex",          (void*)&W(CreateMutex)},
+    {"sceKernelLockMutex",            (void*)&W(LockMutex)},
+    {"sceKernelUnlockMutex",          (void*)&W(UnlockMutex)},
+    {"sceKernelCreateSemaphore",      (void*)&W(CreateSemaphore)},
+    {"sceKernelWaitSemaphore",        (void*)&W(WaitSemaphore)},
+    {"sceKernelSignalSemaphore",      (void*)&W(SignalSemaphore)},
+    {"sceKernelCreateCond",           (void*)&W(CreateCond)},
+    {"sceKernelWaitCond",             (void*)&W(WaitCond)},
+    {"sceKernelSignalCond",           (void*)&W(SignalCond)},
+    {"sceKernelSignalCondAll",        (void*)&W(SignalCondAll)},
+    {"sceKernelWrite",                (void*)&W(Write)},
+    {"sceKernelRead",                 (void*)&W(Read)},
+    {"sceKernelOpen",                 (void*)&W(Open)},
+    {"sceKernelClose",                (void*)&W(Close)},
+    {"sceKernelIsNeoMode",            (void*)&W(IsNeoMode)},
+    {"__stack_chk_fail",              (void*)&W(StackChkFail)},
+    {"__tls_get_addr",                (void*)&W(TlsGetAddr)},
+    {"__cxa_finalize",                (void*)&W(CxaFinalize)},
+    {"psbGetRuntimeVersion",          (void*)&W(GetRuntimeVersion)},
+    {"psbGetRuntimeName",             (void*)&W(GetRuntimeName)},
+};
+#undef W
+#else
 const Export kExports[] = {
     {"sceKernelAllocateDirectMemory", (void*)&sceKernelAllocateDirectMemory},
     {"sceKernelMapDirectMemory",      (void*)&sceKernelMapDirectMemory},
@@ -710,6 +849,7 @@ const Export kExports[] = {
     {"psbGetRuntimeVersion",          (void*)&psbGetRuntimeVersion},
     {"psbGetRuntimeName",             (void*)&psbGetRuntimeName},
 };
+#endif // _WIN32
 
 } // namespace
 

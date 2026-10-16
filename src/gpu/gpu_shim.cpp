@@ -124,6 +124,17 @@ void Device::completeFrame() {
     }
 }
 
+#if defined(_WIN32)
+// Windows SysV->Win64 trampoline target (w64_thunks.asm).
+extern "C" int32_t psbXGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
+                                               uint32_t* dcbSizesInBytes,
+                                               void** ccbAddrs, uint32_t* ccbSizesInBytes,
+                                               uint32_t flags) {
+    return sceGnmSubmitCommandBuffers(count, dcbAddrs, dcbSizesInBytes,
+                                      ccbAddrs, ccbSizesInBytes, flags);
+}
+#endif
+
 extern "C" int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
                                               uint32_t* dcbSizesInBytes,
                                               void** ccbAddrs, uint32_t* ccbSizesInBytes,

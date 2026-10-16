@@ -17,6 +17,11 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Windows guest-hosting shim: SysV->Win64 ABI thunks (MASM), MSVC only.
+if(MSVC)
+  enable_language(ASM_MASM)
+endif()
+
 # ---------------------------------------------------------------------------
 # Core engine library
 # ---------------------------------------------------------------------------
@@ -37,6 +42,10 @@ add_library(psbet_core STATIC
   src/gpu/gpu_shim.cpp
   src/emulator.cpp
 )
+
+if(MSVC)
+  target_sources(psbet_core PRIVATE src/platform/w64_thunks.asm)
+endif()
 target_include_directories(psbet_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(psbet_core PUBLIC Threads::Threads)
 
