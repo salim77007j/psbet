@@ -211,24 +211,36 @@ void KernelState::requestProcessExit(i32 exitCode) {
         g_wakeCv.notify_all(); // wake anyone blocked in kernel primitives
     }
 
+#if defined(_WIN32)
+    // Windows hosting model: no longjmp anywhere (MSVC SEH dispatch cannot
+    // unwind GCC-compiled guest frames). Exit is a recorded, signaled state;
+    // the supervisor's wait returns, and the calling guest thread parks in
+    // host code below — detached at shutdown (the process is exiting).
+    g_wakeCv.notify_all();
+#else
     if (isSupervisorThread()) {
         // Same-thread exit: unwind guest frames through the supervisor env.
         if (g_processEnv) longjmp(*g_processEnv, 1);
         LOG_ERROR("Kernel: process exit without supervisor env — forcing exit(%d)", exitCode);
         std::quick_exit(exitCode);
     }
+#endif
 
-    // Worker thread: unwind OUR OWN guest frames via our thread exit env —
-    // the exact mechanism as sceKernelExitThread. The thread then finishes
-    // normally and stays joinable (Phase-1 parked-forever flaw fixed).
+#if !defined(_WIN32)
+    // POSIX worker thread: unwind OUR OWN guest frames via our thread exit
+    // env — the exact mechanism as sceKernelExitThread. The thread then
+    // finishes normally and stays joinable (Phase-1 parked-forever flaw
+    // fixed).
     if (g_threadExitEnvValid) {
         g_pendingRetVal = first ? exitCode : 0;
         longjmp(g_threadExitEnv.buf, 1);
     }
+#endif
 
-    // Worker outside guest frames (should not happen): park until shutdown,
-    // then block indefinitely in host code — never unwinding guest frames.
-    LOG_WARN("Kernel: ExitProcess from non-guest worker — parking until shutdown");
+    // Worker outside guest frames, or any worker on Windows: park until
+    // shutdown, then block indefinitely in host code — never unwinding
+    // guest frames.
+    LOG_WARN("Kernel: ExitProcess from non-supervisor thread — parking until shutdown");
     std::unique_lock<std::mutex> lk(g_wakeMtx);
     g_wakeCv.wait(lk, [] { return shutdownRequested(); });
     for (;;) std::this_thread::sleep_for(std::chrono::hours(1));

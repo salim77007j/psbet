@@ -126,51 +126,93 @@ void installCrashDiagnostics(std::string* reportSink, u64 moduleBase, u64 module
 #endif
 }
 
+#if defined(_WIN32)
+// ---------------------------------------------------------------------------
+// Windows hosting model: NO longjmp. MSVC's SEH dispatch raises
+// STATUS_INVALID_DISPATCH when unwinding interacts with GCC-compiled guest
+// frames (no MSVC unwind metadata). Instead, the guest runs on a dedicated
+// thread; guest-initiated exits record the code and signal the supervisor,
+// which returns normally. The guest thread parks in host code (never
+// unwinding guest frames) and is detached at shutdown — the process is
+// exiting anyway. Crash diagnostics come from the VEH handler above.
+// ---------------------------------------------------------------------------
 GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {
-    // MSVC constraint: a frame that calls setjmp must not own C++ objects
-    // with destructors — longjmp out of such a frame raises
-    // STATUS_INVALID_DISPATCH (0xC00000FF). The result therefore lives on
-    // the heap and the frame below holds only POD members.
+    GuestRunResult result;
+    installCrashDiagnostics(&result.crashReport, mod.base, mod.imageSize);
+    kernel::beginSupervisorScope();
+    kernel::installThreadTls();
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool guestDone = false;
+
+    std::thread guest([&] {
+        kernel::installThreadTls();
+        using GuestEntry = void (*)();
+        reinterpret_cast<GuestEntry>(mod.entry)();
+        // Guest returned without ExitProcess: natural completion.
+        std::lock_guard<std::mutex> lk(m);
+        guestDone = true;
+        cv.notify_all();
+    });
+
+    // Supervisor wait: guest finished naturally, or an exit was requested
+    // ( sceKernelExitProcess from any guest thread), or a crash was logged.
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] {
+            return guestDone || kernelState.exitRequested()
+                            || !result.crashReport.empty();
+        });
+    }
+    if (guestDone && !kernelState.exitRequested()) {
+        result.exitCode = 0;
+        result.exitedViaGuest = true;
+    } else {
+        result.exitCode = kernelState.exitCode();
+        result.exitedViaGuest = true;
+        LOG_INFO("CPU: guest exit signaled (code %d)", result.exitCode);
+    }
+    guest.join();          // joinable: ExitProcess path parks, never runs away
+    kernel::endSupervisorScope();
+    return result;
+}
+#else
+// ---------------------------------------------------------------------------
+// POSIX hosting model: same-thread setjmp/longjmp (GCC both sides), with the
+// supervisor frame kept free of C++ objects that own destructors.
+// ---------------------------------------------------------------------------
+GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {
+    // MSVC constraint documented for the Windows path; on GCC, longjmp from
+    // a frame with trivially-destructible locals is well-defined in practice
+    // and ASan-verified leak-free (see PHASE_1_REPORT §5).
     struct Ctx {
         jmp_buf                 env;
-        kernel::KernelState*    ks;
-        GuestRunResult*         result;   // heap-owned; string accessed via pointer
-        const LoadedModule*     mod;
     };
     Ctx ctx{};
-    ctx.ks = &kernelState;
-    ctx.mod = &mod;
-    auto* result = new GuestRunResult();
-    ctx.result = result;
 
-    installCrashDiagnostics(&result->crashReport, mod.base, mod.imageSize);
+    GuestRunResult result;
+    installCrashDiagnostics(&result.crashReport, mod.base, mod.imageSize);
     kernel::setProcessJmpBuf(&ctx.env);
 
-    // Mark this thread as the supervisor for the exit protocol (flaw fix:
-    // worker threads must never longjmp on this thread's env).
     kernel::beginSupervisorScope();
-
-    // Install main-thread TLS for module 1 before any guest code runs.
     kernel::installThreadTls();
 
     if (setjmp(ctx.env) == 0) {
         using GuestEntry = void (*)();
         reinterpret_cast<GuestEntry>(mod.entry)();
-        // Guest entry returned without calling ExitProcess: treat as code 0.
-        result->exitCode = 0;
-        result->exitedViaGuest = true;
+        result.exitCode = 0;
+        result.exitedViaGuest = true;
     } else {
-        result->exitCode = kernelState.exitCode();
-        result->exitedViaGuest = true;
-        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result->exitCode);
+        result.exitCode = kernelState.exitCode();
+        result.exitedViaGuest = true;
+        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result.exitCode);
     }
 
     kernel::setProcessJmpBuf(nullptr);
     kernel::endSupervisorScope();
-
-    GuestRunResult out = std::move(*result);
-    delete result;
-    return out;
+    return result;
 }
+#endif
 
 } // namespace psb::cpu
