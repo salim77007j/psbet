@@ -1,0 +1,5 @@
+# Mesa's lavapipe leaks small internal allocations when pipeline creation
+# fails internally (VK_ERROR_UNKNOWN paths). The driver, not PSBET, owns
+# these — suppressed so ASan still covers all PSBET-owned memory.
+leak:libvulkan_lvp.so
+leak:vk_icdGetInstanceProcAddr

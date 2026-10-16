@@ -1,0 +1,68 @@
+name: vulkan-bisect
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  bisect:
+    name: Vulkan pipeline bisect (healthy lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools glslang-tools
+          echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+          glslangValidator --version | head -1
+
+      - name: Generate reference SPIR-V (official glslang)
+        working-directory: ci
+        run: |
+          glslangValidator -V ref.vert -o ref_vs.spv
+          glslangValidator -V ref.frag -o ref_fs.spv
+          ls -la *.spv
+
+      - name: Build bisect tool
+        working-directory: ci
+        run: |
+          set -e
+          # vk_bisect.cpp includes the engine's vendored vulkan header only.
+          g++ -std=c++17 -w -I../src vk_bisect.cpp -o vk_bisect -ldl -lpthread
+          ./vk_bisect 2>&1 | head -2 || true
+
+      - name: Run full combo matrix
+        working-directory: ci
+        run: |
+          set +e
+          # combo = vs*9 + rp*3 + dyn
+          #   vs: 0=glslang-ref 1=psbet-passthrough 2=psbet-yflip
+          #   rp: 0=depth+TS-final 1=depth+CA-final 2=color-only
+          #   dyn: 0=static-viewport 1=dynamic-viewport
+          for vs in 0 1 2; do
+            for rp in 0 1 2; do
+              for dyn in 0 1; do
+                c=$((vs*9 + rp*3 + dyn))
+                out=$(timeout 30 ./vk_bisect $c 2>&1)
+                ec=$?
+                if [ $ec -eq 139 ]; then
+                  echo "combo $c : SEGFAULT"
+                elif [ $ec -eq 124 ]; then
+                  echo "combo $c : TIMEOUT"
+                else
+                  echo "$out" | tail -1
+                fi
+              done
+            done
+          done
+
+      - name: Probe with mesa debug env
+        working-directory: ci
+        run: |
+          set +e
+          MESA_DEBUG=1 LP_NUM_THREADS=1 ./vk_bisect 0 2>&1 | tail -5
+          echo "---- combo 9 (psbet passthrough, depth+TS, static) with MESA_DEBUG:"
+          MESA_DEBUG=1 LP_NUM_THREADS=1 ./vk_bisect 9 2>&1 | tail -5

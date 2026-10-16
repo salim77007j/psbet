@@ -112,7 +112,8 @@ jobs:
 
       - name: Tests under ASan/UBSan (guests stay non-instrumented)
         working-directory: build-asan
-        run: ./psbet_tests
+        run: >
+          ../ci/lsan_wrap.sh ./psbet_tests
 
   windows:
     name: Windows build + guest execution
