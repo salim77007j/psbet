@@ -146,7 +146,7 @@ jobs:
         working-directory: build
         timeout-minutes: 5
         run: |
-          Release\psbet.exe run ..\guests\hello.elf
+          Release\psbet.exe run ..\guests\hello.elf --verbose
           echo "exit: $LASTEXITCODE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

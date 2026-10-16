@@ -146,10 +146,14 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
     std::condition_variable cv;
     bool guestDone = false;
 
+    LOG_INFO("CPU: guest thread launching (%s)", "");
     std::thread guest([&] {
+        LOG_INFO("CPU: guest thread entered trampoline", "");
         kernel::installThreadTls();
+        LOG_INFO("CPU: guest thread TLS installed", "");
         using GuestEntry = void (*)();
         reinterpret_cast<GuestEntry>(mod.entry)();
+        LOG_INFO("CPU: guest entry returned naturally", "");
         // Guest returned without ExitProcess: natural completion.
         std::lock_guard<std::mutex> lk(m);
         guestDone = true;
