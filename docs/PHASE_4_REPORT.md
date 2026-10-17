@@ -195,8 +195,10 @@ marked CI.
 
 ### 5.1 CI hardening addendum (same day, post-merge)
 
-Three CI defects surfaced after the Phase 4 push and were fixed before the
-phase was declared green:
+Defects surfaced after the Phase 4 push and were fixed before the phase
+was declared green. The headline: **CI is fully green again on all three
+jobs (Linux, Linux-ASan, Windows) — the first all-green Windows run since
+Phase 2.**
 
 1. `std::sinf` in a test is a libstdc++ extension, not standard C++ — the
    runner's GCC rejected it under `-Werror` (local GCC 14.2 had accepted
@@ -222,6 +224,52 @@ phase was declared green:
    median (13×)** — observations now land at the next poll after the
    scripted time, pure poll quantization, independent of backend speed.
    All suites re-verified: 31/31 (plain), RDNA 8/8, fuzz 64/64.
+
+4. **Windows platform repair (the largest item).** Discovery during this
+   work: the Windows job had been red-or-skipped since the **Phase 3
+   push** — the last all-green run predates it — so the Phase 3 report's
+   "all jobs green" was wrong and the Windows path below had never
+   actually executed in CI. The repair, each item root-caused from
+   runner logs:
+   - MSVC build: `syscall_trap.cpp`'s non-Linux fallback compiled outside
+     the namespace (Mode unreachable); `pfs.cpp` passed
+     `fs::path::c_str()` (wchar_t on Windows) to fopen; the Phase-4 unit
+     tests sat inside the `PSBET_RUN_GUEST_TESTS` guard while `main()`
+     calls them unconditionally. All three fixed.
+   - MASM: the Phase-4 thunk targets lacked their `EXTERN` declarations
+     (A2006).
+   - **Thunk arities**: SysV passes args 1–6 in REGISTERS (stack starts
+     at the 7th); the old `thunk5/6` read "stack args" from guest stack
+     garbage and wrote Win64 stack args one slot high, and `thunk7`
+     overwrote its own return address. All rebuilt; three wrong `thunkN`
+     assignments corrected (AllocateDirectMemory 4→6, MapDirectMemory
+     5→6, CreateThread 6→7 — the v1.2 out-pointer had been dropped).
+     `ci/audit_thunks.py` now machine-checks every thunkN use against the
+     guest ABI (0/81 mismatches).
+   - **Supervisor teardown hang**: the Windows guest thread parks inside
+     `requestProcessExit` without notifying the supervisor's local cv (and
+     the VEH sets crashReport from another thread) — a plain `cv.wait`
+     slept past the flip forever. Now a 10 ms deadline poll.
+   - **Host→guest ABI bridge**: `sceKernelStartThread`'s MSVC lambda
+     called the GCC guest entry directly (Win64 RCX/RDX vs SysV
+     RDI/RSI) — hello.exe's worker dereferenced garbage `argp`. New
+     `psbTWinGuestThreadEntry` asm bridge (which must also PRESERVE
+     RDI/RSI — Win64-nonvolatile, SysV-volatile); the guest main entry
+     routes through it too.
+   - **Guest libc shim**: Linux resolved guest `strlen/strncmp/sinf/
+     sincosf` via `dlsym(RTLD_DEFAULT)`; Windows has no equivalent —
+     net_probe failed at LOAD. Explicit clean-room shims now exported on
+     both platforms (thunk-routed; float args ride XMM0 in both ABIs).
+   - **GNM exports bypassed the thunks**: the GPU export table bound
+     guests directly to the MSVC functions on Windows (silent `-1` on
+     submit — count read from RCX). Now routed through `psbTWinGnm*`.
+   - CI harness: the worker_exit gate expects exit code 7, but the GHA
+     pwsh wrapper re-exits with `$LASTEXITCODE` — explicit `exit 0` on
+     the success path.
+   Validation: abi_probe (arity 1–6 + ptr + TLS + threads) PASSED,
+   hello (2 workers × 1000 locked increments, per-thread TLS) PASSED,
+   worker_exit (exit-code 7 contract) PASSED, net_probe PASSED,
+   audio_tone PASSED on Windows; all Linux suites unaffected.
 
 ## 6. Testing your own images (user-provided, legally owned)
 
