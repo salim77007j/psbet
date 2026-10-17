@@ -168,10 +168,16 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
     // ( sceKernelExitProcess from any guest thread), or a crash was logged.
     {
         std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] {
-            return guestDone || kernelState.exitRequested()
-                            || !result.crashReport.empty();
-        });
+        // NOTE: on Windows the guest thread parks INSIDE requestProcessExit
+        // (it never returns to the lambda above), and the VEH handler sets
+        // crashReport from another thread — so BOTH exitRequested() and
+        // crashReport() flip WITHOUT a notification on this cv. A plain
+        // cv.wait would sleep forever past the flip. Re-evaluate on a short
+        // deadline loop instead (the Phase-3 rework's latent teardown hang,
+        // first exercised by the abi_probe gate).
+        while (!(guestDone || kernelState.exitRequested()
+                           || !result.crashReport.empty()))
+            cv.wait_for(lk, std::chrono::milliseconds(10));
     }
     if (guestDone && !kernelState.exitRequested()) {
         result.exitCode = 0;
