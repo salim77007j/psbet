@@ -104,6 +104,12 @@ EXTERN psbXNetCtlGetState:PROC
 
 _TEXT SEGMENT
 
+; ABI INVARIANT: every thunk assumes it is ENTERED BY CALL (guest `call` via
+; the PLT), i.e. RSP % 16 == 8 on entry with the return address at [rsp].
+; That makes RSP 16-aligned at each `call target`, as Win64 requires. Guests
+; must not tail-jump imports (no `return sce*` wrappers in the corpus); if a
+; tail-jumping guest ever appears, add dynamic alignment here.
+
 ; --- arity 0 -----------------------------------------------------------------
 thunk0 MACRO name, target
 name PROC
@@ -171,78 +177,80 @@ name PROC
 name ENDP
 ENDM
 
-; --- arity 5: 4 register shuffles + 1 stack arg ---------------------------------
-; SysV stack arg 5 sits at [rsp+8] on entry (return address at [rsp]).
-; Win64 wants it at [rsp+28h+8] after we reserve shadow space (the callee
-; reads stack arg 5 at [rsp+28h+8] relative to its own entry).
-; Strategy: reserve 38h, copy the stack arg, then call.
+; --- arity 5: SysV a1..a5 ALL in registers (RDI,RSI,RDX,RCX,R8) ---------------
+; SysV x86-64 passes args 1-6 in registers; the stack carries arg 7+. So a5
+; arrives in R8 and must be captured BEFORE the shuffle clobbers it. Win64
+; stack args start at caller [rsp+20h] (callee [rsp+28h] after ret push).
+; Reserve 38h: 20h shadow + 8 a5 + 8 pad (entry RSP%16=8; 8+38h ≡ 0 at call).
 thunk5 MACRO name, target
 name PROC
-    mov     r9,  rcx
-    mov     r8,  rdx
-    mov     rdx, rsi
-    mov     rcx, rdi
-    mov     rax, [rsp+8]          ; SysV stack arg 5
+    mov     rax, r8               ; SysV a5 (register, not stack!)
+    mov     r9,  rcx              ; a4
+    mov     r8,  rdx              ; a3
+    mov     rdx, rsi              ; a2
+    mov     rcx, rdi              ; a1
     sub     rsp, 38h
-    mov     [rsp+28h], rax        ; Win64 stack arg 5 slot
+    mov     [rsp+20h], rax        ; Win64 a5 slot
     call    target
     add     rsp, 38h
     ret
 name ENDP
 ENDM
 
-; --- arity 6: 4 register shuffles + 2 stack args --------------------------------
+; --- arity 6: SysV a1..a6 ALL in registers (RDI,RSI,RDX,RCX,R8,R9) -------------
+; a5 (R8) and a6 (R9) become Win64 stack args at [rsp+20h]/[rsp+28h].
+; Both are captured BEFORE the shuffle clobbers R8/R9.
 thunk6 MACRO name, target
 name PROC
-    mov     r9,  rcx
-    mov     r8,  rdx
-    mov     rdx, rsi
-    mov     rcx, rdi
-    mov     rax, [rsp+8]          ; stack arg 5
-    mov     r10, [rsp+10h]        ; stack arg 6
-    sub     rsp, 38h
-    mov     [rsp+28h], rax
-    mov     [rsp+30h], r10
+    mov     rax, r9               ; SysV a6
+    mov     r10, r8               ; SysV a5
+    mov     r9,  rcx              ; a4
+    mov     r8,  rdx              ; a3
+    mov     rdx, rsi              ; a2
+    mov     rcx, rdi              ; a1
+    sub     rsp, 38h              ; 20h shadow + 10h args + 8 pad, 16-aligned
+    mov     [rsp+20h], r10        ; Win64 a5
+    mov     [rsp+28h], rax        ; Win64 a6
     call    target
     add     rsp, 38h
     ret
 name ENDP
 ENDM
 
-; --- arity 7: SysV has 6 register args; Win64 only 4 ---------------------------
-; SysV reg args 4 (R8) and 5 (R9) become Win64 STACK args 5 and 6, and the
-; single SysV stack arg (7th) lands at [rsp+38h]. Scratch registers RAX/R10/
-; R11 are volatile in both ABIs; the originals are captured before the
-; register shuffle clobbers R8/R9.
+; --- arity 7: SysV a1..a6 in registers, a7 on the stack ([rsp+8] on entry) -----
+; Win64: a1..a4 registers, a5/a6/a7 on the stack at [rsp+20h]/28h/30h.
+; The old version wrote a7 at [rsp+38h] after sub 38h — which is the thunk's
+; OWN return-address slot (entry [rsp]) — a guaranteed wild jump on first use.
+; Reserve 48h: 20h shadow + 18h args + 10h pad (8+48h ≡ 0 at call).
 thunk7 MACRO name, target
 name PROC
-    mov     rax, [rsp+8]          ; SysV stack arg 7
-    mov     r10, r8               ; SysV arg 5 -> Win64 stack arg 5
-    mov     r11, r9               ; SysV arg 6 -> Win64 stack arg 6
-    mov     r9,  rcx
-    mov     r8,  rdx
-    mov     rdx, rsi
-    mov     rcx, rdi
-    sub     rsp, 38h
-    mov     [rsp+28h], r10
-    mov     [rsp+30h], r11
-    mov     [rsp+38h], rax
+    mov     rax, [rsp+8]          ; SysV a7 (correct: first SysV stack arg)
+    mov     r10, r8               ; SysV a5
+    mov     r11, r9               ; SysV a6
+    mov     r9,  rcx              ; a4
+    mov     r8,  rdx              ; a3
+    mov     rdx, rsi              ; a2
+    mov     rcx, rdi              ; a1
+    sub     rsp, 48h
+    mov     [rsp+20h], r10        ; Win64 a5
+    mov     [rsp+28h], r11        ; Win64 a6
+    mov     [rsp+30h], rax        ; Win64 a7
     call    target
-    add     rsp, 38h
+    add     rsp, 48h
     ret
 name ENDP
 ENDM
 
 ; --- exports -----------------------------------------------------------------
-thunk4 psbTWinAllocateDirectMemory, psbXSysAllocateDirectMemory   ; 6 args
-thunk5 psbTWinMapDirectMemory,      psbXSysMapDirectMemory        ; 5 args
+thunk6 psbTWinAllocateDirectMemory, psbXSysAllocateDirectMemory   ; 6 args
+thunk6 psbTWinMapDirectMemory,      psbXSysMapDirectMemory        ; 6 args
 thunk1 psbTWinGetDirectMemorySize,  psbXSysGetDirectMemorySize
 thunk0 psbTWinGetProcessTime,       psbXSysGetProcessTime
 thunk0 psbTWinGetProcessTimeInTick, psbXSysGetProcessTimeInTick
 thunk1 psbTWinUsleep,               psbXSysUsleep
 thunk2 psbTWinNanosleep,            psbXSysNanosleep
 thunk1 psbTWinSleep,                psbXSysSleep
-thunk6 psbTWinCreateThread,         psbXSysCreateThread           ; 6 args
+thunk7 psbTWinCreateThread,         psbXSysCreateThread           ; 7 args (v1.2: +cpuAffinityMask/out)
 thunk3 psbTWinStartThread,          psbXSysStartThread
 thunk3 psbTWinWaitThreadEnd,        psbXSysWaitThreadEnd
 thunk1 psbTWinExitThread,           psbXSysExitThread
