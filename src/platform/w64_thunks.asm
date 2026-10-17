@@ -77,6 +77,30 @@ EXTERN psbXSysFstat:PROC
 EXTERN psbXGnmReserveGpuAddress:PROC
 EXTERN psbXGnmMapGpuAddress:PROC
 EXTERN psbXGnmUnmapGpuAddress:PROC
+; --- Phase-4 surface (audio / pad / net / counters) ---------------------------
+EXTERN psbXSysGetProcessTimeCounter:PROC
+EXTERN psbXSysGetProcessTimeCounterFrequency:PROC
+EXTERN psbXAudioOutOpen:PROC
+EXTERN psbXAudioOutOutput:PROC
+EXTERN psbXAudioOutSetVolume:PROC
+EXTERN psbXAudioOutClose:PROC
+EXTERN psbXPadOpen:PROC
+EXTERN psbXPadReadState:PROC
+EXTERN psbXPadRead:PROC
+EXTERN psbXPadGetControllerInformation:PROC
+EXTERN psbXNetInit:PROC
+EXTERN psbXNetTerm:PROC
+EXTERN psbXNetSocket:PROC
+EXTERN psbXNetConnect:PROC
+EXTERN psbXNetBind:PROC
+EXTERN psbXNetListen:PROC
+EXTERN psbXNetAccept:PROC
+EXTERN psbXNetSend:PROC
+EXTERN psbXNetRecv:PROC
+EXTERN psbXNetCloseSocket:PROC
+EXTERN psbXNetCtlInit:PROC
+EXTERN psbXNetCtlTerm:PROC
+EXTERN psbXNetCtlGetState:PROC
 
 _TEXT SEGMENT
 
