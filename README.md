@@ -4,15 +4,15 @@
 software (x86-64 guest images with Orbis-style system interfaces) on standard
 PCs running Linux and Windows.
 
-> **Status: Phase 2 complete** — everything from Phase 1 (proven end-to-end on
-> real homebrew guests, ASan/UBSan clean) plus: a **Vulkan GPU backend** with
-> an RDNA→SPIR-V **shader recompiler** (table-driven, 55-opcode documented
-> subset, 510-program validation corpus), shader/pipeline caches, a
-> thread-correct process lifecycle (cooperative exit/termination), Windows
-> guest execution with SEH crash diagnostics, and a signal-guarded Vulkan
-> self-test that degrades gracefully on broken driver stacks. See
-> [`docs/PHASE_2_REPORT.md`](docs/PHASE_2_REPORT.md) and
-> [`docs/RDNA_SUBSET.md`](docs/RDNA_SUBSET.md).
+> **Status: Phase 3 complete** — everything from Phases 1–2 plus: the faithful
+> memory model (typed direct-memory pools, two-level guest page tables, a
+> separate **GPU virtual address space**), a virtualized filesystem
+> (`app0:/` container mounts + writable `/data`), event queues (EQUEUE), a
+> raw-syscall containment layer (seccomp-based), ELF loader v2 for
+> real-image layouts (ET_EXEC, non-zero bases, IRELATIVE, RELRO), zero-
+> detached-thread teardown (measured), and the Windows SysV→Win64 ABI
+> conformance suite (the Phase-2 residual corruption root-caused and
+> regression-locked). See `docs/PHASE_3_REPORT.md`.
 
 ![Cube demo](docs/screenshots/cube_soak_frame_5400.png)
 

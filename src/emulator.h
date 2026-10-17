@@ -17,6 +17,9 @@ struct EmuOptions {
     u32         maxFrames = 1000000;       // safety frame limit
     bool        verbose = false;
     std::string backend = "auto";    // auto | software | vulkan
+    std::string mountImage;          // read-only app0:/ container (Phase 3)
+    std::string dataDir;             // writable /data host dir (Phase 3)
+    std::string syscallTrap = "on";  // on | off | required (Phase 3)
 };
 
 struct EmuStats {
@@ -30,6 +33,11 @@ struct EmuStats {
     u64    peakRssKiB = 0;
     std::string crashReport;
     std::string backendUsed;         // "software" | "vulkan"
+    // Phase-3 fidelity accounting:
+    u32    threadsJoined = 0;        // guest threads joined at teardown
+    u32    threadsDetached = 0;      // force-detached stragglers (0 = clean)
+    u32    threadsParked = 0;        // Windows recorded-exit parks
+    u64    memoryUsedBytes = 0;      // physical bytes live at exit
 };
 
 class Emulator {

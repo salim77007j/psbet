@@ -15,6 +15,8 @@
 #include "core/elf.h"
 #include "core/kernel_shim.h"
 #include "core/cpu_supervisor.h"
+#include "core/vfs.h"
+#include "core/syscall_trap.h"
 #include "gpu/gpu_shim.h"
 #include "gpu/png.h"
 #include "gpu/vulkan_device.h"
@@ -65,6 +67,20 @@ void* resolveImports(const char* name) {
 EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     EmuStats stats;
     const u64 t0 = nowUs();
+
+    // ---- 0. Filesystem virtualization + syscall containment -----------------
+    vfs::shutdown();   // reset any state from a previous run in-process
+    if (!opt.dataDir.empty()) vfs::initDataDir(opt.dataDir);
+    if (!opt.mountImage.empty() && !vfs::mountImage(opt.mountImage)) {
+        LOG_ERROR("Emulator: app0 mount failed: %s", opt.mountImage.c_str());
+        stats.guestExitCode = 2;
+        return stats;
+    }
+
+    syscall_trap::Mode trapMode = syscall_trap::Mode::On;
+    if (opt.syscallTrap == "off") trapMode = syscall_trap::Mode::Off;
+    else if (opt.syscallTrap == "required") trapMode = syscall_trap::Mode::Required;
+    kernel::KernelState::get().setSyscallTrapMode(trapMode);
 
     // ---- 1. Guest address space ------------------------------------------
     MemoryManager mem;
@@ -147,6 +163,7 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
                  wantBackend == "auto" ? " (auto — Vulkan unavailable)" : "");
     }
     device->setMaxFrames(opt.maxFrames);
+    device->setAddressSpace(&mem.guest());   // GPU-VA draws (PBFF v1.1)
     gpu::setActiveDevice(device.get());
 
     if (!opt.screenshotDir.empty()) {
@@ -185,6 +202,7 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
 
     // ---- 5. Teardown + stats -----------------------------------------------
     kernel::KernelState::get().shutdownThreads();
+    vfs::shutdown();
 
     stats.guestExitCode = run.exitCode;
     stats.exitedViaGuest = run.exitedViaGuest;
@@ -196,6 +214,12 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
         ? static_cast<double>(stats.frames) * 1000.0 / static_cast<double>(stats.elapsedMs)
         : 0.0;
     stats.peakRssKiB = peakRssKiB();
+
+    const kernel::ThreadStats ts = kernel::KernelState::get().lastThreadStats();
+    stats.threadsJoined = ts.joined;
+    stats.threadsDetached = ts.detached;
+    stats.threadsParked = ts.parked;
+    stats.memoryUsedBytes = mem.bytesAllocated();
 
     if (stats.crashed) {
         LOG_ERROR("Emulator: guest crashed — see crash report");

@@ -3,8 +3,9 @@
 //  ELF64 image loading: mapping, dynamic scanning, relocation, initializers.
 //
 //  Guest ABI contract (enforced, see docs/GUEST_ABI.md):
-//    * ET_DYN x86-64 image, first PT_LOAD covers file offset 0 at vaddr 0
-//      (standard PIE layout), entry point is a plain SysV function.
+//    * ET_DYN x86-64 image at any layout (vaddr 0 anchoring is the common
+//      PIE case, no longer mandatory) or ET_EXEC at absolute vaddrs.
+//    * Plain SysV entry. Images without PT_DYNAMIC load as static-style.
 // ============================================================================
 #include "elf.h"
 
@@ -65,10 +66,14 @@ Result ElfLoader::inspect(const std::string& path, std::string& reportOut) {
         return Result::fail(Status::InvalidArgument, "not an ELF image");
 
     char line[192];
-    std::snprintf(line, sizeof(line), "Class: %s  Data: %s  Machine: %u  Type: %u  OSABI: %u\n",
+    std::snprintf(line, sizeof(line),
+                  "Class: %s  Data: %s  Machine: %u  Type: %s (%u)  OSABI: %u\n",
                   eh.ident[4] == kElfClass64 ? "ELF64" : "other",
                   eh.ident[5] == kElfDataLE ? "LE" : "other",
-                  eh.machine, eh.type, eh.ident[7]);
+                  eh.machine,
+                  eh.type == kElfTypeExec ? "ET_EXEC"
+                  : eh.type == kElfTypeDyn ? "ET_DYN" : "?",
+                  eh.type, eh.ident[7]);
     reportOut += line;
     std::snprintf(line, sizeof(line), "Entry: 0x%llx  Phoff: %llu  Phnum: %u\n",
                   static_cast<unsigned long long>(eh.entry),
@@ -87,6 +92,7 @@ Result ElfLoader::inspect(const std::string& path, std::string& reportOut) {
         const char* t = ph[i].type == PT_LOAD ? "LOAD"
                       : ph[i].type == PT_DYNAMIC ? "DYNAMIC"
                       : ph[i].type == PT_TLS ? "TLS"
+                      : ph[i].type == PT_GNU_RELRO ? "RELRO"
                       : ph[i].type == PT_GNU_STACK ? "GNU_STACK" : "OTHER";
         std::snprintf(line, sizeof(line),
                       "  %-2u  %-9s  %c%c%c    0x%012llx  0x%012llx  %llu\n",
@@ -104,6 +110,14 @@ Result ElfLoader::inspect(const std::string& path, std::string& reportOut) {
 
 // ---------------------------------------------------------------------------
 // load
+// ---------------------------------------------------------------------------
+// Phase-3 loader contract (docs/GUEST_ABI.md §1):
+//   * ET_DYN images load at any layout (first PT_LOAD may sit at any vaddr;
+//     relocations anchor the image).
+//   * ET_EXEC images load at their absolute vaddrs — the address space must
+//     be free there (PA = vaddr inside the regular pool).
+//   * Images without PT_DYNAMIC load as static-style (no relocations).
+//   * R_X86_64_IRELATIVE is resolved by executing the addend resolver.
 // ---------------------------------------------------------------------------
 Result ElfLoader::load(const std::string& path, u32 /*moduleId*/, LoadedModule& mod) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -136,12 +150,10 @@ Result ElfLoader::load(const std::string& path, u32 /*moduleId*/, LoadedModule& 
     if (eh->machine != kElfMachineX64)
         return Result::fail(Status::Unsupported, "only x86-64 guest images are supported");
 
-    if (eh->type == kElfTypeExec)
+    if (eh->type != kElfTypeExec && eh->type != kElfTypeDyn)
         return Result::fail(Status::Unsupported,
-            "position-dependent (ET_EXEC) images are not supported in Phase 1; "
-            "link the guest as ET_DYN/PIE (see docs/GUEST_ABI.md)");
-    if (eh->type != kElfTypeDyn)
-        return Result::fail(Status::Unsupported, "unsupported ELF type (want ET_DYN)");
+            "unsupported ELF type (want ET_DYN or ET_EXEC)");
+    mod.isExec = (eh->type == kElfTypeExec);
 
     if (eh->ident[7] == 9) // ELFOSABI_FREEBSD — PS5's ABI flavour
         LOG_INFO("ELF: PS5-style OSABI (FreeBSD) detected — accepted");
@@ -149,23 +161,41 @@ Result ElfLoader::load(const std::string& path, u32 /*moduleId*/, LoadedModule& 
     if (eh->phnum == 0 || eh->phnum > 256)
         return Result::fail(Status::InvalidArgument, "implausible program header count");
 
+    // Entry offset from the FILE header (valid for every layout: vaddr 0
+    // anchors ET_DYN, absolute vaddrs anchor ET_EXEC).
+    mod.entryOffset = eh->entry;
+
     mod.path = path;
     Result r = mapSegments(mod);
     if (!r) return r;
-    r = scanDynamic(mod);
+    mod.entry = mod.base + mod.entryOffset;
+    r = scanDynamic(mod);      // tolerant: static-style images pass through
     if (!r) return r;
     r = relocate(mod);
     if (!r) return r;
 
-    // Read the entry point from the MAPPED image (fileBytes were released
-    // by scanDynamic; the first PT_LOAD covers offset 0 by ABI contract).
-    const Elf64Ehdr* ehMapped = reinterpret_cast<const Elf64Ehdr*>(mod.base);
-    mod.entry = mod.base + ehMapped->entry;
+    // RELRO: after relocations, make the GNU_RELRO region read-only.
+    if (mod.relroSize) {
+        if (!mem_.protectRange(mod.base + mod.relroVaddr, mod.relroSize,
+                               vm::Prot::ReadOnly))
+            LOG_WARN("ELF: RELRO protection could not be fully applied");
+        else
+            LOG_DEBUG("ELF: RELRO region made read-only (vaddr 0x%llx, %llu B)",
+                      static_cast<unsigned long long>(mod.relroVaddr),
+                      static_cast<unsigned long long>(mod.relroSize));
+    }
     return Result::ok();
 }
 
 // ---------------------------------------------------------------------------
-// mapSegments
+// mapSegments — map every PT_LOAD into the guest address space.
+//
+//   ET_DYN: one contiguous span covers [lo, hi); the image's vaddr 0 anchors
+//           at (span - lo), so mod.base + vaddr always lands inside the span.
+//   ET_EXEC: the span reserves PA = vaddr (absolute layout); mod.base is the
+//            arena base (guest vaddrs are absolute).
+//   The span is mapped read-write first (the loader's patch window), file
+//   bytes + bss are copied, then each segment gets its final protections.
 // ---------------------------------------------------------------------------
 Result ElfLoader::mapSegments(LoadedModule& mod) {
     const Elf64Ehdr* eh = reinterpret_cast<const Elf64Ehdr*>(mod.fileBytes.data());
@@ -177,34 +207,63 @@ Result ElfLoader::mapSegments(LoadedModule& mod) {
         return Result::fail(Status::InvalidArgument, "program header table out of bounds");
     std::memcpy(ph.data(), file + eh->phoff, sizeof(Elf64Phdr) * eh->phnum);
 
-    u64 lo = ~0ull, hi = 0;
+    u64 lo = ~0ull, hi = 0, maxAlign = 0x1000;
     for (const auto& p : ph) {
         if (p.type != PT_LOAD) continue;
         lo = std::min<u64>(lo, p.vaddr);
         hi = std::max<u64>(hi, p.vaddr + p.memsz);
+        if (p.align) maxAlign = std::max<u64>(maxAlign, p.align);
     }
     if (hi <= lo) return Result::fail(Status::InvalidArgument, "no PT_LOAD segments");
-    if (lo != 0)
-        return Result::fail(Status::Unsupported,
-            "guest ABI contract requires the first PT_LOAD at vaddr 0 "
-            "(standard PIE layout); see docs/GUEST_ABI.md");
 
-    mod.imageSize = hi;
     const std::string imageName = mod.soname.empty() ? "guest-image" : mod.soname;
-    mod.base = mem_.allocate(static_cast<size_t>(mod.imageSize), 0x1000,
-                             imageName.c_str(), vm::Prot::ReadWrite);
-    if (!mod.base)
-        return Result::fail(Status::OutOfMemory, "failed to allocate image span");
+    GuestMemory& gm = mem_.guest();
+
+    // Span in PA space: page-aligned superset of every PT_LOAD.
+    const u64 spanLo = mod.isExec ? (lo & ~0xFFFull) : lo;
+    const u64 spanHi = alignUp(hi, 0x1000);
+    const u64 spanLen = spanHi - spanLo;
+    if (spanHi > GuestMemory::kPaRegularSize)
+        return Result::fail(Status::Unsupported,
+            "image vaddrs exceed the regular physical pool "
+            "(ET_EXEC images must live below 8 GiB)");
+
+    u64 paSpan = 0;
+    if (mod.isExec) {
+        paSpan = gm.allocDirectFixed(GuestMemory::kPoolRegular, spanLo, spanLen,
+                                     imageName.c_str());
+        if (!paSpan)
+            return Result::fail(Status::OutOfMemory,
+                "ET_EXEC image vaddrs collide with existing allocations "
+                "(or exceed the pool)");
+        mod.base = mem_.arenaBase();
+    } else {
+        paSpan = gm.allocDirect(GuestMemory::kPoolRegular, spanLen, maxAlign,
+                                0, 0, imageName.c_str());
+        if (!paSpan)
+            return Result::fail(Status::OutOfMemory, "failed to allocate image span");
+        mod.base = mem_.arenaBase() + paSpan - lo;
+    }
+    mod.paBase = paSpan;
+    mod.imageSize = spanLen;
+    mod.vaddrLo = lo;
+
+    // Loader patch window: whole span read-write (copy + relocation phase),
+    // final per-segment protections applied below.
+    if (!gm.mapDirect(paSpan, spanLen, vm::Prot::ReadWrite, imageName.c_str()))
+        return Result::fail(Status::OutOfMemory,
+                            "page-table map failed for the image span");
+    u8* span = reinterpret_cast<u8*>(mem_.arenaBase() + paSpan);
 
     for (const auto& p : ph) {
         if (p.type != PT_LOAD) continue;
         if (p.offset + p.filesz > fileSize)
             return Result::fail(Status::InvalidArgument, "PT_LOAD segment out of file bounds");
 
-        u64 dst = mod.base + p.vaddr;
-        std::memcpy(reinterpret_cast<void*>(dst), file + p.offset, p.filesz);
+        u8* dst = span + (p.vaddr - spanLo);
+        std::memcpy(dst, file + p.offset, p.filesz);
         if (p.memsz > p.filesz)
-            std::memset(reinterpret_cast<void*>(dst + p.filesz), 0, p.memsz - p.filesz);
+            std::memset(dst + p.filesz, 0, p.memsz - p.filesz);
 
         mod.segments.push_back({p.vaddr, p.memsz, p.flags});
 
@@ -212,24 +271,30 @@ Result ElfLoader::mapSegments(LoadedModule& mod) {
         if (p.flags & PF_W) prot = vm::Prot::ReadWrite;
         if (p.flags & PF_X) prot = (p.flags & PF_W) ? vm::Prot::ReadWriteExec
                                                     : vm::Prot::ReadExec;
-        if (!mem_.protectRange(dst, p.memsz, prot))
+        if (!mem_.protectRange(reinterpret_cast<u64>(dst), p.memsz, prot))
             return Result::fail(Status::InternalError, "failed to apply segment protections");
 
-        LOG_DEBUG("ELF: mapped %c%c%c seg 0x%llx..0x%llx (%llu B)",
+        LOG_DEBUG("ELF: mapped %c%c%c seg vaddr 0x%llx (%llu B)",
                   (p.flags & PF_R) ? 'R' : '-', (p.flags & PF_W) ? 'W' : '-',
                   (p.flags & PF_X) ? 'X' : '-',
-                  static_cast<unsigned long long>(dst),
-                  static_cast<unsigned long long>(dst + p.memsz),
+                  static_cast<unsigned long long>(p.vaddr),
                   static_cast<unsigned long long>(p.memsz));
     }
 
     for (const auto& p : ph) {
         if (p.type == PT_TLS) {
+            if (mod.tlsImageSize) {
+                LOG_WARN("ELF: multiple PT_TLS segments — the first one is used");
+                continue;
+            }
             mod.tlsImageSize = p.filesz;
             mod.tlsMemSize   = p.memsz;
             mod.tlsAlignment = p.align ? p.align : 8;
             mod.tlsImage.assign(file + p.offset, file + p.offset + p.filesz);
             mod.tlsImage.resize(static_cast<size_t>(p.memsz)); // zero .tbss tail
+        } else if (p.type == PT_GNU_RELRO) {
+            mod.relroVaddr = p.vaddr;
+            mod.relroSize  = p.memsz;
         }
     }
     return Result::ok();
@@ -238,15 +303,24 @@ Result ElfLoader::mapSegments(LoadedModule& mod) {
 // ---------------------------------------------------------------------------
 // scanDynamic — walk PT_DYNAMIC from the mapped image, record everything the
 // relocation and initializer passes need, then release the file bytes.
+// Static-style images (no PT_DYNAMIC) pass through with a log line.
 // ---------------------------------------------------------------------------
 Result ElfLoader::scanDynamic(LoadedModule& mod) {
-    const Elf64Ehdr* eh = reinterpret_cast<const Elf64Ehdr*>(mod.base);
-    const Elf64Phdr* phIt = reinterpret_cast<const Elf64Phdr*>(mod.base + eh->phoff);
+    // ehdr/phdrs sit at vaddr lo + file offset (the first PT_LOAD carries
+    // them with p_offset 0), so anchor the walk at base + vaddrLo.
+    const Elf64Ehdr* eh = reinterpret_cast<const Elf64Ehdr*>(mod.base + mod.vaddrLo);
+    const Elf64Phdr* phIt = reinterpret_cast<const Elf64Phdr*>(
+        mod.base + mod.vaddrLo + eh->phoff);
 
     u64 dynVaddr = 0;
     for (u32 i = 0; i < eh->phnum; ++i)
         if (phIt[i].type == PT_DYNAMIC) dynVaddr = phIt[i].vaddr;
-    if (!dynVaddr) return Result::fail(Status::InvalidArgument, "image has no PT_DYNAMIC");
+    if (!dynVaddr) {
+        LOG_INFO("ELF: image has no PT_DYNAMIC — loading as static-style");
+        mod.fileBytes.clear();
+        mod.fileBytes.shrink_to_fit();
+        return Result::ok();
+    }
 
     const Elf64Dyn* dyn = reinterpret_cast<const Elf64Dyn*>(mod.base + dynVaddr);
 
@@ -276,8 +350,8 @@ Result ElfLoader::scanDynamic(LoadedModule& mod) {
         }
     }
 
-    if (!mod.dynStrtab || !mod.dynSymtab)
-        return Result::fail(Status::InvalidArgument, "image lacks DT_STRTAB/DT_SYMTAB");
+    if (mod.dynStrtab && !mod.dynSymtab)
+        return Result::fail(Status::InvalidArgument, "image lacks DT_SYMTAB");
 
     mod.fileBytes.clear();
     mod.fileBytes.shrink_to_fit();
@@ -288,6 +362,13 @@ Result ElfLoader::scanDynamic(LoadedModule& mod) {
 // relocate
 // ---------------------------------------------------------------------------
 Result ElfLoader::relocate(LoadedModule& mod) {
+    if (!mod.dynRela && !mod.dynJmprel) {
+        LOG_DEBUG("relocate: no relocation tables (static-style image)");
+        return Result::ok();
+    }
+    if (!mod.dynStrtab || !mod.dynSymtab)
+        return Result::fail(Status::InvalidArgument, "relocations without DT_STRTAB/DT_SYMTAB");
+
     const char*     strBase = reinterpret_cast<const char*>(mod.base + mod.dynStrtab);
     const Elf64Sym* symBase = reinterpret_cast<const Elf64Sym*>(mod.base + mod.dynSymtab);
 
@@ -328,9 +409,20 @@ Result ElfLoader::relocate(LoadedModule& mod) {
                 *reinterpret_cast<u64*>(where) = mod.base + static_cast<u64>(rel[i].addend);
                 continue;
             }
-            if (type == R_X86_64_IRELATIVE)
-                return Result::fail(Status::Unsupported,
-                    "R_X86_64_IRELATIVE (ifunc) is not supported in Phase 1");
+            if (type == R_X86_64_IRELATIVE) {
+                // Phase 3: resolve by executing the addend resolver (guest
+                // code, C ABI, returns the implementation address).
+                using IrelFn = u64 (*)(void);
+                const u64 resolver = symIx
+                    ? mod.base + symBase[symIx].value + static_cast<u64>(rel[i].addend)
+                    : mod.base + static_cast<u64>(rel[i].addend);
+                const u64 impl = reinterpret_cast<IrelFn>(resolver)();
+                *reinterpret_cast<u64*>(where) = impl;
+                LOG_DEBUG("relocate: IRELATIVE at 0x%llx -> 0x%llx",
+                          static_cast<unsigned long long>(rel[i].offset),
+                          static_cast<unsigned long long>(impl));
+                continue;
+            }
 
             u64 S = 0;
             if (symIx) {

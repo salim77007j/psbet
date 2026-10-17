@@ -72,10 +72,15 @@ struct Elf64Dyn {
 
 #pragma pack(pop)
 
+// ELF types
+constexpr u16 ET_EXEC = 2;
+constexpr u16 ET_DYN  = 3;
+
 // Program header types
 constexpr u32 PT_LOAD       = 1;
 constexpr u32 PT_DYNAMIC    = 2;
 constexpr u32 PT_TLS        = 7;
+constexpr u32 PT_GNU_RELRO  = 0x6474E552;
 constexpr u32 PT_GNU_STACK  = 0x6474E551;
 
 // Segment flags
@@ -116,12 +121,19 @@ constexpr u32 R_X86_64_IRELATIVE = 37;
 // --------------------------------------------------------------------------
 struct LoadedModule {
     std::string path;
-    u64  base      = 0;   // guest virtual address of image start
-    u64  entry     = 0;   // guest virtual address of entry point
+    u64  base      = 0;   // host address anchoring vaddr 0
+    u64  entry     = 0;   // host address of the entry point
+    u64  entryOffset = 0; // entry vaddr (from the file header)
     u64  imageSize = 0;
+    u64  paBase    = 0;   // physical span base (ET_DYN); 0 for ET_EXEC
+    bool isExec    = false; // ET_EXEC (absolute vaddrs)
 
     struct Segment { u64 vaddr; u64 memsz; u32 flags; };
     std::vector<Segment> segments;
+
+    u64 relroVaddr = 0;   // PT_GNU_RELRO (made read-only after relocation)
+    u64 relroSize  = 0;
+    u64 vaddrLo    = 0;   // lowest PT_LOAD vaddr (ehdr/phdr anchor for scans)
 
     // TLS block template (initial image of .tdata + .tbss zero region)
     u64  tlsMemSize   = 0;

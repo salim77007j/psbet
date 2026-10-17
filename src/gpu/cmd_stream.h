@@ -1,11 +1,12 @@
 // ============================================================================
 //  PSBET — cmd_stream.h
-//  GPU command stream ("PBFF" — PSBET Buffer Format, v1).
+//  GPU command stream ("PBFF" — PSBET Buffer Format, v1.1).
 //
 //  Clean-room command-buffer definition. Guests build typed command packets
 //  into a contiguous buffer and submit it via sceGnmSubmitCommandBuffers.
-//  Phase 1 executes these on the software rasterizer; the Vulkan backend
-//  (Phase 2) will execute the same packets on the host GPU.
+//  Phase 1 executed these on the software rasterizer; Phase 2 added the
+//  Vulkan backend; Phase 3 adds GPU-virtual-address packets (v1.1): draws
+//  may fetch vertices through the GPU page tables instead of inline payloads.
 //
 //  Vertex stage contract (v1): vertices arrive in NDC (x, y, z, w) with
 //  pre-transformed positions (the guest performs matrix math). z is used as
@@ -20,12 +21,14 @@
 namespace psb::gpu {
 
 enum class CmdOp : u32 {
-    Nop           = 0,
-    Clear         = 1,
-    SetViewport   = 2,
-    SetDepthTest  = 3,
-    SetCullMode   = 4,
-    DrawTriangles = 5,
+    Nop               = 0,
+    Clear             = 1,
+    SetViewport       = 2,
+    SetDepthTest      = 3,
+    SetCullMode       = 4,
+    DrawTriangles     = 5,
+    // ---- v1.1: GPU virtual address draws ---------------------------------
+    DrawTrianglesGpu  = 6,   // vertices fetched via the GPU page tables
 };
 
 enum class DepthFunc : u32 { Never = 0, Less = 1, Equal = 2, LEqual = 3 };
@@ -65,6 +68,16 @@ struct CmdDrawTriangles {
     CmdHeader hdr{CmdOp::DrawTriangles, sizeof(CmdDrawTriangles)};
     u32 vertexCount = 0;
     // followed by vertexCount * GpuVertex
+};
+
+// v1.1: draw whose vertex data lives at a GPU virtual address (mapped via
+// sceGnmMapGpuAddress). The device translates gpuVa through the GPU page
+// tables per submit; unmapped or out-of-range addresses reject the buffer.
+struct CmdDrawTrianglesGpu {
+    CmdHeader hdr{CmdOp::DrawTrianglesGpu, sizeof(CmdDrawTrianglesGpu)};
+    u32 vertexCount = 0;
+    u32 reserved = 0;
+    u64 gpuVa = 0;      // byte address in the GPU VA space
 };
 
 #pragma pack(pop)

@@ -8,7 +8,7 @@ on:
 
 jobs:
   linux:
-    name: Linux build + tests + Vulkan + demo
+    name: Linux build + tests + Vulkan + fuzz + demo
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,13 +29,17 @@ jobs:
         working-directory: build
         run: ./psbet gpu
 
-      - name: Unit + integration tests (software AND Vulkan backends)
+      - name: Unit + integration tests (incl. Phase-3 guest suite)
         working-directory: build
         run: ./psbet_tests
 
       - name: RDNA subset corpus tests
         working-directory: build
         run: ./psbet_rdna_tests
+
+      - name: Fuzzed guest corpus (kernel API + PBFF, deterministic)
+        working-directory: build
+        run: ./psbet_fuzz 64
 
       - name: Run cube demo (Vulkan backend) + capture screenshots
         working-directory: build
@@ -57,6 +61,23 @@ jobs:
           echo "psbet (software) exit code: $rc"
           test "$rc" -eq 124
 
+      - name: Phase-3 live demo — GPU-VA draw path + container mount
+        working-directory: build
+        run: |
+          ./psbet run cube_vm.elf --backend vulkan --frames 90 \
+              --screenshot-dir shots-vm --screenshot-interval 30 || rc=$?
+          echo "psbet (cube_vm, GPU virtual memory) exit code: $rc"
+          test "$rc" -eq 124
+          # app0 container mount through the VFS (psa pack + guest fs_demo).
+          mkdir -p fsroot/docs
+          echo "PSBET app0 container" > fsroot/manifest.txt
+          echo "hello" > fsroot/docs/readme.md
+          ./psbet mkfsa fsroot fsroot.psa
+          ./psbet run fs_demo.elf --mount-pfs fsroot.psa --data-dir fsdata
+          ./psbet run abi_probe.elf
+          ./psbet run equeue_demo.elf
+          ./psbet run syscall_probe.elf --syscall-trap on
+
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
@@ -65,7 +86,12 @@ jobs:
             build/psbet
             build/hello.elf
             build/cube.elf
+            build/cube_vm.elf
             build/worker_exit.elf
+            build/abi_probe.elf
+            build/fs_demo.elf
+            build/equeue_demo.elf
+            build/syscall_probe.elf
 
       - name: Upload Vulkan demo screenshots
         uses: actions/upload-artifact@v4
@@ -79,6 +105,12 @@ jobs:
           name: psbet-demo-screenshots-software
           path: build/shots-sw/*.png
 
+      - name: Upload GPU-VA demo screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-demo-screenshots-gpu-va
+          path: build/shots-vm/*.png
+
       - name: Upload guest ELF images (for the Windows job)
         uses: actions/upload-artifact@v4
         with:
@@ -86,7 +118,11 @@ jobs:
           path: |
             build/hello.elf
             build/cube.elf
+            build/cube_vm.elf
             build/worker_exit.elf
+            build/abi_probe.elf
+            build/fs_demo.elf
+            build/equeue_demo.elf
 
   linux-asan:
     name: Linux ASan/UBSan
@@ -115,8 +151,13 @@ jobs:
         run: >
           ../ci/lsan_wrap.sh ./psbet_tests
 
+      - name: Fuzz corpus under ASan/UBSan
+        working-directory: build-asan
+        run: >
+          ../ci/lsan_wrap.sh ./psbet_fuzz 16
+
   windows:
-    name: Windows build + guest execution
+    name: Windows build + guest execution (ABI conformance)
     needs: linux          # ELF guest images are cross-built by the GCC toolchain
     runs-on: windows-latest
     steps:
@@ -132,39 +173,43 @@ jobs:
         working-directory: build
         run: Release\psbet_tests.exe
 
-      # Phase 2: the Windows hosting shim runs the REAL ELF guest images
+      # Phase 3: the Windows hosting shim runs the REAL ELF guest images
       # (built by the Linux job's GCC — guests are toolchain-independent:
-      # PSBET itself is their "OS"). Exit code 124 is the designed frame-limit
-      # exit for the demo.
+      # PSBET itself is their "OS"). The Phase-2 thunk3 defect (arg2 lost on
+      # every 3-argument call) is FIXED and regression-locked by abi_probe.
+      # hello + worker_exit + abi_probe are HARD GATES now.
       - name: Download guest ELF images
         uses: actions/download-artifact@v4
         with:
           name: psbet-guest-elves
           path: guests
 
-      # Phase 2 status: guests LOAD, bind kernel imports through the SysV->Win64
-      # thunks, print, create kernel objects and run workers on Windows. A
-      # residual value-corruption (TLS/printf paths) remains - tracked for
-      # Phase 3 (see PHASE_2_REPORT). These steps are diagnostic, hence
-      # continue-on-error; the Windows CORE suite above is the hard gate.
-      - name: Run hello.elf on Windows (diagnostic)
+      - name: Run abi_probe.elf on Windows (ABI conformance — hard gate)
         working-directory: build
         timeout-minutes: 5
-        continue-on-error: true
         run: |
-          Release\psbet.exe run ..\guests\hello.elf --verbose
+          Release\psbet.exe run ..\guests\abi_probe.elf
           echo "exit: $LASTEXITCODE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run worker_exit.elf on Windows (diagnostic)
+      - name: Run hello.elf on Windows (hard gate)
         working-directory: build
         timeout-minutes: 5
-        continue-on-error: true
+        run: |
+          Release\psbet.exe run ..\guests\hello.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run worker_exit.elf on Windows (flaw-1 regression — hard gate)
+        working-directory: build
+        timeout-minutes: 5
         run: |
           Release\psbet.exe run ..\guests\worker_exit.elf
           echo "exit: $LASTEXITCODE"
           if ($LASTEXITCODE -ne 7) { exit $LASTEXITCODE }
 
+      # cube renders through the parked-thread exit path (frame limit);
+      # kept diagnostic while the Windows park accounting is observed.
       - name: Run cube.elf on Windows + screenshots (diagnostic)
         working-directory: build
         timeout-minutes: 5

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include "psbet/common.h"
+#include "core/syscall_trap.h"
 
 namespace psb {
 
@@ -21,6 +22,13 @@ namespace kernel {
 
 // Thread entry ABI (Orbis-style: argc/argv replaced by arglen/argp).
 using PsbThreadEntry = i32 (*)(size_t arglen, void* argp);
+
+// Guest-thread teardown accounting (filled by shutdownThreads).
+struct ThreadStats {
+    u32 joined   = 0;   // finished guest threads joined at teardown
+    u32 detached = 0;   // stragglers force-detached (must stay 0 in tests)
+    u32 parked   = 0;   // Windows-only recorded-exit parks (never unwound)
+};
 
 // TLS descriptor layout expected by the x86-64 general-dynamic TLS model.
 struct PsbTlsIndex {
@@ -63,6 +71,12 @@ public:
     // Wakes everything blocked in kernel primitives, joins finished threads,
     // and detaches only genuinely compute-bound stragglers (logged).
     void shutdownThreads();
+    // Snapshot of the last teardown (joined/detached/parked counts).
+    kernel::ThreadStats lastThreadStats() const;
+
+    // Raw-syscall containment mode for guest threads (set before guests run).
+    void setSyscallTrapMode(syscall_trap::Mode m);
+    syscall_trap::Mode syscallTrapMode() const;
 
     // --- Process start time (for GetProcessTime) --------------------------
     void setProcessStart(u64 usSinceEpochSteady);
@@ -89,6 +103,9 @@ private:
     bool exitRequested_ = false;
     i32  exitCode_ = 0;
 
+    ThreadStats threadStats_;
+    syscall_trap::Mode trapMode_ = syscall_trap::Mode::On;
+
     u64 startUs_ = 0;
 };
 
@@ -103,6 +120,16 @@ void* processJmpBuf();
 // set before guest entry and cleared after (RAII in runGuestEntry).
 void beginSupervisorScope();
 void endSupervisorScope();
+
+// Runs a guest entry point on the CURRENT thread as a cooperative guest
+// main: installs per-thread TLS and the raw-syscall trap, then calls the
+// entry under this thread's exit env. sceKernelExitThread / sceKernelExit
+// Process from this thread unwind via that env (never across threads).
+// Sets *done and returns the recorded/pending exit code when guest code has
+// fully unwound. Runs on the dedicated guest thread spawned by the CPU
+// supervisor — engine threads never execute guest code and therefore never
+// carry the syscall filter.
+i32 runGuestMainCooperative(void* entry, bool* done);
 
 // True when called from the thread that owns the process jmp_buf (the CPU
 // supervisor's main thread). Workers get the cooperative path instead.

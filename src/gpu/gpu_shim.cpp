@@ -7,6 +7,9 @@
 
 #include "core/log.h"
 #include "core/kernel_shim.h"
+#include "core/memory.h"
+#include "core/guest_vm.h"
+#include "psbet/psb_guest_api.h"
 
 namespace psb::gpu {
 
@@ -100,6 +103,41 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
                 break;
             }
 
+            case CmdOp::DrawTrianglesGpu: {
+                // v1.1: vertices live at a GPU virtual address. Translate
+                // through the GPU page tables per submit — an unmapped or
+                // out-of-window address rejects the buffer.
+                if (hdr.size < sizeof(CmdDrawTrianglesGpu)) return false;
+                CmdDrawTrianglesGpu pkt;
+                std::memcpy(&pkt, cursor, sizeof(pkt));
+                if (!addressSpace_) {
+                    LOG_ERROR("GPU: GPU-VA draw without an address space");
+                    return false;
+                }
+                const size_t wantBytes = static_cast<size_t>(pkt.vertexCount)
+                                       * sizeof(GpuVertex);
+                // Translate the FIRST byte, then verify the whole span is
+                // backed by contiguous physical pages (page-table walk).
+                u8* host = static_cast<u8*>(addressSpace_->gpuTranslate(pkt.gpuVa));
+                if (!host) {
+                    LOG_ERROR("GPU: GPU-VA draw at 0x%llx — unmapped",
+                              static_cast<unsigned long long>(pkt.gpuVa));
+                    return false;
+                }
+                for (u64 off = 0; off < wantBytes; off += 0x1000) {
+                    u64 pa = 0;
+                    const u64 page = pkt.gpuVa + off;
+                    if (!addressSpace_->gpuTranslateRaw(page, &pa)) {
+                        LOG_ERROR("GPU: GPU-VA draw span unmapped at 0x%llx",
+                                  static_cast<unsigned long long>(page));
+                        return false;
+                    }
+                }
+                backend_->drawTriangles(reinterpret_cast<GpuVertex*>(host),
+                                        pkt.vertexCount);
+                break;
+            }
+
             default:
                 LOG_ERROR("GPU: unknown opcode %u — aborting buffer",
                           static_cast<u32>(hdr.op));
@@ -133,6 +171,15 @@ extern "C" int32_t psbXGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
     return sceGnmSubmitCommandBuffers(count, dcbAddrs, dcbSizesInBytes,
                                       ccbAddrs, ccbSizesInBytes, flags);
 }
+extern "C" int32_t psbXGnmReserveGpuAddress(uint64_t a, uint64_t b, uint64_t c, uint64_t* d) {
+    return sceGnmReserveGpuAddress(a, b, c, d);
+}
+extern "C" int32_t psbXGnmMapGpuAddress(uint64_t a, int64_t b, uint64_t c, uint32_t d) {
+    return sceGnmMapGpuAddress(a, b, c, d);
+}
+extern "C" int32_t psbXGnmUnmapGpuAddress(uint64_t a, uint64_t b) {
+    return sceGnmUnmapGpuAddress(a, b);
+}
 #endif
 
 extern "C" int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
@@ -158,9 +205,39 @@ extern "C" int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
     return 0;
 }
 
+// ---- GPU virtual memory (v1.2) ---------------------------------------------
+extern "C" int32_t sceGnmReserveGpuAddress(uint64_t len, uint64_t alignment,
+                                           uint64_t fixedGpuVa, uint64_t* gpuVaOut) {
+    if (!gpuVaOut || len == 0) return -1;
+    kernel::KernelState& k = kernel::KernelState::get();
+    const u64 va = k.memory()->guest().gpuReserve(len, alignment, fixedGpuVa);
+    if (!va) return -1;
+    *gpuVaOut = va;
+    return 0;
+}
+
+extern "C" int32_t sceGnmMapGpuAddress(uint64_t gpuVa, int64_t physAddr,
+                                       uint64_t len, uint32_t prot) {
+    if (physAddr <= 0 || len == 0) return -1;
+    kernel::KernelState& k = kernel::KernelState::get();
+    vm::Prot p = vm::Prot::ReadOnly;
+    if (prot & PSB_PROT_WRITE) p = vm::Prot::ReadWrite;
+    return k.memory()->guest().gpuMap(gpuVa, static_cast<u64>(physAddr), len, p)
+        ? 0 : -1;
+}
+
+extern "C" int32_t sceGnmUnmapGpuAddress(uint64_t gpuVa, uint64_t len) {
+    if (len == 0) return -1;
+    kernel::KernelState& k = kernel::KernelState::get();
+    return k.memory()->guest().gpuUnmap(gpuVa, len) ? 0 : -1;
+}
+
 namespace {
 const struct { const char* name; void* fn; } kGpuExports[] = {
     {"sceGnmSubmitCommandBuffers", (void*)&sceGnmSubmitCommandBuffers},
+    {"sceGnmReserveGpuAddress",    (void*)&sceGnmReserveGpuAddress},
+    {"sceGnmMapGpuAddress",        (void*)&sceGnmMapGpuAddress},
+    {"sceGnmUnmapGpuAddress",      (void*)&sceGnmUnmapGpuAddress},
 };
 } // namespace
 

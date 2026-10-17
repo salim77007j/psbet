@@ -12,6 +12,10 @@
 #include <memory>
 #include <string>
 
+namespace psb {
+class GuestMemory;
+}
+
 namespace psb::gpu {
 
 // ---------------------------------------------------------------------------
@@ -42,6 +46,9 @@ public:
     u64 maxFrames() const { return maxFrames_; }
     bool frameLimitHit() const { return frameLimitHit_; }
 
+    // Phase-3 GPU VM: the address space used to translate GPU-VA draws.
+    void setAddressSpace(GuestMemory* space) { addressSpace_ = space; }
+
     // Called once per completed guest submit: bumps the frame counter, runs
     // the frame hook, and enforces the safety frame limit (requests guest
     // exit(124) when hit).
@@ -57,6 +64,7 @@ private:
     u32    height_;
     std::unique_ptr<IRasterBackend> backend_;
     const char* backendName_ = "software";
+    GuestMemory* addressSpace_ = nullptr;   // GPU VA translation (Phase 3)
 
     u64  frames_ = 0;
     u64  maxFrames_ = ~0ull;
@@ -70,6 +78,13 @@ extern "C" int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
                                               uint32_t* dcbSizesInBytes,
                                               void** ccbAddrs, uint32_t* ccbSizesInBytes,
                                               uint32_t flags);
+
+// Guest-visible GPU virtual-memory surface (v1.2; see docs/GUEST_ABI.md §9).
+extern "C" int32_t sceGnmReserveGpuAddress(uint64_t len, uint64_t alignment,
+                                           uint64_t fixedGpuVa, uint64_t* gpuVaOut);
+extern "C" int32_t sceGnmMapGpuAddress(uint64_t gpuVa, int64_t physAddr,
+                                       uint64_t len, uint32_t prot);
+extern "C" int32_t sceGnmUnmapGpuAddress(uint64_t gpuVa, uint64_t len);
 
 // The active device used by the shim (set by the Emulator before guest load).
 void setActiveDevice(Device* device);

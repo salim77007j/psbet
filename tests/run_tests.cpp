@@ -18,7 +18,9 @@
 
 #include "psbet/common.h"
 #include "core/memory.h"
+#include "core/elf.h"
 #include "core/log.h"
+#include "core/pfs.h"
 #include "gpu/png.h"
 #include "gpu/rasterizer.h"
 #include "gpu/gpu_shim.h"
@@ -209,6 +211,89 @@ bool test_pixel_compare_backends() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. Page tables + GPU VM (Phase 3): typed pools, PTE walk, conflicts, and
+//     GPU virtual-address translation through a separate page-table domain.
+// ---------------------------------------------------------------------------
+bool test_guest_vm_model() {
+    psb::MemoryManager mem;
+    CHECK(mem.init());
+    auto& gm = mem.guest();
+
+    // Typed pools: a GPU-pool allocation lands in the GPU-visible window.
+    const psb::u64 paGpu = gm.allocDirect(psb::GuestMemory::kPoolGpuVisible, 0x4000,
+                                          0x1000, 0, 0, "t-gpu");
+    CHECK(paGpu != 0);
+    CHECK(paGpu >= psb::GuestMemory::kPaRegularSize);
+
+    // Search ranges are honoured: force a high regular allocation.
+    const psb::u64 paHi = gm.allocDirect(psb::GuestMemory::kPoolRegular, 0x2000,
+                                         0x1000, 1 * psb::GiB, 2 * psb::GiB, "t-hi");
+    CHECK(paHi >= 1 * psb::GiB && paHi < 2 * psb::GiB);
+
+    // Identity CPU map + PTE walk.
+    const psb::u64 vaGpu = gm.mapDirect(paGpu, 0x4000, psb::vm::Prot::ReadWrite, "t-gpu");
+    CHECK(vaGpu == mem.arenaBase() + paGpu);
+    volatile psb::u8* p = reinterpret_cast<volatile psb::u8*>(vaGpu);
+    p[0] = 0x11; p[0x3FFF] = 0x22;
+    CHECK(p[0] == 0x11 && p[0x3FFF] == 0x22);
+
+    // queryVa returns the mapping covering an address.
+    psb::GuestMemory::BlockInfo info;
+    CHECK(gm.queryVa(vaGpu + 0x123, &info));
+    CHECK(info.pa == paGpu && info.len == 0x4000);
+
+    // freeDirect is refcount-guarded: refuses while mapped, works after unmap.
+    CHECK(!gm.freeDirect(paGpu, 0x4000));
+    CHECK(gm.unmap(vaGpu, 0x4000));
+    CHECK(gm.freeDirect(paGpu, 0x4000));
+
+    // GPU VM: reserve -> map -> translate (separate address space; GPU VAs
+    // have nothing to do with CPU VAs).
+    const psb::u64 pa2 = gm.allocDirect(psb::GuestMemory::kPoolRegular, 0x3000,
+                                        0x1000, 0, 0, "t-va");
+    CHECK(pa2 != 0);
+    psb::u64 gva = gm.gpuReserve(0x3000, 0x1000, 0);
+    CHECK(gva != 0 && gva < psb::GuestMemory::kGpuVaSize);
+    CHECK(gm.gpuMap(gva, pa2, 0x3000, psb::vm::Prot::ReadWrite));
+    psb::u64 paWalk = 0;
+    CHECK(gm.gpuTranslateRaw(gva + 0x1234, &paWalk));
+    CHECK(paWalk == pa2 + 0x1234);
+    void* host = gm.gpuTranslate(gva);
+    CHECK(host == reinterpret_cast<void*>(mem.arenaBase() + pa2));
+    // Unmapped GPU VAs translate to nothing.
+    CHECK(gm.gpuTranslate(gva + 0x3000) == nullptr);
+    // Fixed GPU VA reservation collides while mapped.
+    CHECK(gm.gpuReserve(0x1000, 0x1000, gva) == 0);
+    CHECK(gm.gpuUnmap(gva, 0x3000));
+    psb::u64 gva2 = gm.gpuReserve(0x1000, 0x1000, gva);
+    CHECK(gva2 == gva);
+    CHECK(gm.freeDirect(pa2, 0x3000));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 1d. PageTable PTE-level conflicts (Phase 3).
+// ---------------------------------------------------------------------------
+bool test_page_table_conflicts() {
+    psb::PageTable pt;
+    CHECK(pt.map(0x1000, 0x1000, 0x5000, psb::vm::Prot::ReadWrite));
+    psb::u64 pa = 0;
+    CHECK(pt.translate(0x1234, &pa));
+    CHECK(pa == 0x5234);
+    // Same-page double map with a DIFFERENT frame must fail.
+    CHECK(!pt.map(0x1000, 0x1000, 0x9000, psb::vm::Prot::ReadWrite));
+    // setProt updates without remapping; unmap clears.
+    CHECK(pt.setProt(0x1000, psb::vm::Prot::ReadOnly));
+    CHECK(pt.queryProt(0x1000) == psb::vm::Prot::ReadOnly);
+    CHECK(pt.unmap(0x1000, 0x1000));
+    CHECK(!pt.translate(0x1000, nullptr));
+    // Large coverage: 2 MiB mid-page boundary crossing.
+    CHECK(pt.map(0x1FF000, 0x2000, 0x1FF000, psb::vm::Prot::ReadWrite));
+    CHECK(pt.translate(0x200FFF, &pa) && pa == 0x200FFF);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 2. PNG writer
 // ---------------------------------------------------------------------------
 bool test_png_writer() {
@@ -396,6 +481,163 @@ bool test_cmd_executor() {
 // 5+6. End-to-end guest tests (POSIX hosts only in Phase 1)
 // ---------------------------------------------------------------------------
 #ifdef PSBET_RUN_GUEST_TESTS
+
+// ---------------------------------------------------------------------------
+// Phase-3 loader conformance: hand-synthesized ELF64 images exercising the
+// real-image paths (ET_EXEC absolute vaddrs, ET_DYN with non-zero first
+// vaddr, static images without PT_DYNAMIC, IRELATIVE resolution by executing
+// the guest resolver, and GNU_RELRO). The exit-process address is patched in
+// at build time (runtime-known host address).
+// ---------------------------------------------------------------------------
+using psb::Elf64Ehdr;
+using psb::Elf64Phdr;
+using psb::Elf64Rela;
+using psb::Elf64Dyn;
+using psb::u8;
+using psb::u16;
+using psb::u32;
+using psb::u64;
+using psb::i64;
+
+extern "C" void sceKernelExitProcess(int32_t);
+
+// mov edi, imm32; movabs rax, addr; call rax  ->  sceKernelExitProcess(imm32)
+static void writeExitStub(u8* at, u32 code, void* exitFn) {
+    at[0] = 0xBF;   // mov edi, imm32
+    std::memcpy(at + 1, &code, 4);
+    at[5] = 0x48; at[6] = 0xB8;   // movabs rax, imm64
+    std::memcpy(at + 7, &exitFn, 8);
+    at[15] = 0xFF; at[16] = 0xD0; // call rax
+}
+
+static void patchRel32(u8* at, i64 disp) { std::memcpy(at, &disp, 4); }
+
+static void initEhdr(Elf64Ehdr* eh, u16 type, u64 entry, u16 phnum) {
+    std::memset(eh, 0, sizeof(*eh));
+    std::memcpy(eh->ident, "\x7f""ELF", 4);
+    eh->ident[4] = 2;   // ELF64
+    eh->ident[5] = 1;   // LE
+    eh->ident[6] = 1;   // EV_CURRENT
+    eh->type = type;
+    eh->machine = 62;
+    eh->version = 1;
+    eh->entry = entry;
+    eh->phoff = sizeof(Elf64Ehdr);
+    eh->phentsize = sizeof(Elf64Phdr);
+    eh->phnum = phnum;
+}
+
+bool test_loader_et_exec_static() {
+    // ET_EXEC at absolute vaddr 0x60000000, one RWX PT_LOAD, no dynamic.
+    std::vector<u8> img(0x2000, 0);
+    auto* eh = reinterpret_cast<Elf64Ehdr*>(img.data());
+    initEhdr(eh, psb::ET_EXEC, 0x60000000 + 0x100, 1);
+    auto* ph = reinterpret_cast<Elf64Phdr*>(img.data() + sizeof(Elf64Ehdr));
+    std::memset(ph, 0, sizeof(*ph));
+    ph->type = psb::PT_LOAD; ph->flags = 7; ph->offset = 0;
+    ph->vaddr = 0x60000000; ph->filesz = 0x2000; ph->memsz = 0x2000;
+    ph->align = 0x1000;
+    writeExitStub(img.data() + 0x100, 42, reinterpret_cast<void*>(&sceKernelExitProcess));
+
+    std::FILE* f = std::fopen("t_exec.elf", "wb");
+    CHECK(f != nullptr);
+    std::fwrite(img.data(), 1, img.size(), f);
+    std::fclose(f);
+
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("t_exec.elf", opt);
+    std::remove("t_exec.elf");
+    CHECK(st.guestExitCode == 42);
+    CHECK(!st.crashed);
+    return true;
+}
+
+bool test_loader_dyn_offset_static() {
+    // ET_DYN whose first PT_LOAD sits at vaddr 0x2000 (non-zero lo), static.
+    std::vector<u8> img(0x2000, 0);
+    auto* eh = reinterpret_cast<Elf64Ehdr*>(img.data());
+    initEhdr(eh, psb::ET_DYN, 0x2000 + 0x100, 1);
+    auto* ph = reinterpret_cast<Elf64Phdr*>(img.data() + sizeof(Elf64Ehdr));
+    std::memset(ph, 0, sizeof(*ph));
+    ph->type = psb::PT_LOAD; ph->flags = 7; ph->offset = 0;
+    ph->vaddr = 0x2000; ph->filesz = 0x2000; ph->memsz = 0x2000;
+    ph->align = 0x1000;
+    writeExitStub(img.data() + 0x100, 43, reinterpret_cast<void*>(&sceKernelExitProcess));
+
+    std::FILE* f = std::fopen("t_dynoff.elf", "wb");
+    CHECK(f != nullptr);
+    std::fwrite(img.data(), 1, img.size(), f);
+    std::fclose(f);
+
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("t_dynoff.elf", opt);
+    std::remove("t_dynoff.elf");
+    CHECK(st.guestExitCode == 43);
+    CHECK(!st.crashed);
+    return true;
+}
+
+bool test_loader_irelative_relro() {
+    // ET_DYN, PT_DYNAMIC with one IRELATIVE whose resolver runs (guest code)
+    // and whose GOT page is placed under PT_GNU_RELRO.
+    //   0x000 ehdr+phdrs | 0x800 resolver | 0x840 target | 0x900 entry
+    //   0x1000 GOT (RELRO) | 0x1020 rela | 0x1030 strtab | 0x1048 symtab
+    //   0x1078 dynamic
+    std::vector<u8> img(0x2000, 0);
+    auto* eh = reinterpret_cast<Elf64Ehdr*>(img.data());
+    initEhdr(eh, psb::ET_DYN, 0x900, 3);
+    auto* ph = reinterpret_cast<Elf64Phdr*>(img.data() + sizeof(Elf64Ehdr));
+    std::memset(ph, 0, 3 * sizeof(Elf64Phdr));
+    ph[0] = {psb::PT_LOAD, 7, 0, 0, 0, 0x2000, 0x2000, 0x1000};
+    ph[1] = {psb::PT_DYNAMIC, 6, 0x1078, 0x1078, 0, 0x60, 0x60, 8};
+    ph[2] = {psb::PT_GNU_RELRO, 4, 0x1000, 0x1000, 0, 0x1000, 0x1000, 1};
+
+    // resolver @0x800: lea rax,[rip+0x39] (target @0x840); ret
+    img[0x800] = 0x48; img[0x801] = 0x8D; img[0x802] = 0x05;
+    patchRel32(img.data() + 0x803, 0x840 - 0x807);
+    img[0x807] = 0xC3;
+    // target @0x840: exit(55)
+    writeExitStub(img.data() + 0x840, 55, reinterpret_cast<void*>(&sceKernelExitProcess));
+    // entry @0x900: mov rax,[rip+disp] (GOT @0x1000); call rax
+    img[0x900] = 0x48; img[0x901] = 0x8B; img[0x902] = 0x05;
+    patchRel32(img.data() + 0x903, 0x1000 - 0x907);
+    img[0x907] = 0xFF; img[0x908] = 0xD0;
+
+    // rela @0x1020: IRELATIVE, GOT <- resolver
+    auto* rel = reinterpret_cast<Elf64Rela*>(img.data() + 0x1020);
+    rel->offset = 0x1000;
+    rel->info = (static_cast<u64>(0) << 32) | psb::R_X86_64_IRELATIVE;
+    rel->addend = 0x800;
+    // empty strtab @0x1030 (single NUL), NULL symtab entry @0x1048 (24 B)
+    img[0x1030] = 0;
+    // dynamic @0x1078
+    auto* dyn = reinterpret_cast<Elf64Dyn*>(img.data() + 0x1078);
+    const int nd = 0;
+    int di = 0;
+    dyn[di++] = {psb::DT_STRTAB, 0x1030};
+    dyn[di++] = {psb::DT_SYMTAB, 0x1048};
+    dyn[di++] = {psb::DT_RELA, 0x1020};
+    dyn[di++] = {psb::DT_RELASZ, 24};
+    dyn[di++] = {psb::DT_RELAENT, 24};
+    dyn[di++] = {psb::DT_NULL, 0};
+    (void)nd;
+
+    std::FILE* f = std::fopen("t_irel.elf", "wb");
+    CHECK(f != nullptr);
+    std::fwrite(img.data(), 1, img.size(), f);
+    std::fclose(f);
+
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("t_irel.elf", opt);
+    std::remove("t_irel.elf");
+    CHECK(st.guestExitCode == 55);
+    CHECK(!st.crashed);
+    return true;
+}
+
 bool test_guest_hello() {
     psb::Emulator emu;
     psb::EmuOptions opt;
@@ -435,6 +677,7 @@ bool test_guest_cube() {
     CHECK(st.frames == 45);
     CHECK(st.screenshots == 3);           // frames 15, 30, 45
     CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);       // Phase-3: clean teardown
 
     // A screenshot must exist and be a real PNG.
     std::FILE* f = std::fopen("test_shots/frame_0030.png", "rb");
@@ -444,6 +687,91 @@ bool test_guest_cube() {
     static const psb::u8 want[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     CHECK(std::memcmp(sig, want, 8) == 0);
     std::fclose(f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase-3 end-to-end guest suite.
+// ---------------------------------------------------------------------------
+bool test_guest_abi_probe() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("abi_probe.elf", opt);
+    CHECK(st.guestExitCode == 0);         // every thunk arity verified
+    CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);
+    return true;
+}
+
+bool test_guest_equeue() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("equeue_demo.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);
+    return true;
+}
+
+bool test_guest_fs_demo() {
+    // Container image for app0 (PSA built here, verified by the guest).
+    std::filesystem::create_directories("fsapp/docs");
+    {
+        std::FILE* f = std::fopen("fsapp/manifest.txt", "wb");
+        CHECK(f != nullptr);
+        std::fputs("PSBET app0 container", f);
+        std::fclose(f);
+        f = std::fopen("fsapp/docs/readme.md", "wb");
+        CHECK(f != nullptr);
+        std::fputs("readme", f);
+        std::fclose(f);
+    }
+    CHECK(psb::pfs::PsbArchive::packDirectory("fsapp", "fsapp.psa"));
+
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.mountImage = "fsapp.psa";
+    opt.dataDir = "fsdata";
+    const psb::EmuStats st = emu.run("fs_demo.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    // The guest's /data write must have landed in the host data dir.
+    std::FILE* f = std::fopen("fsdata/hello.txt", "rb");
+    CHECK(f != nullptr);
+    char buf[32] = {};
+    CHECK(std::fread(buf, 1, sizeof(buf) - 1, f) == 19);
+    CHECK(std::memcmp(buf, "psbet vfs roundtrip", 19) == 0);
+    std::fclose(f);
+    std::filesystem::remove_all("fsapp");
+    std::filesystem::remove("fsapp.psa");
+    std::filesystem::remove_all("fsdata");
+    return true;
+}
+
+bool test_guest_syscall_probe() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.syscallTrap = "on";               // containment must be active
+    const psb::EmuStats st = emu.run("syscall_probe.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    return true;
+}
+
+bool test_guest_cube_vm() {
+    // The Phase-1 cube, drawn from GPU virtual memory (PBFF v1.1).
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.width = 320; opt.height = 180;
+    opt.maxFrames = 30;
+    opt.screenshotDir = "test_shots_vm";
+    opt.screenshotInterval = 30;
+    const psb::EmuStats st = emu.run("cube_vm.elf", opt);
+    CHECK(st.guestExitCode == 124);
+    CHECK(st.frames == 30);
+    CHECK(st.screenshots == 1);
+    CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);
     return true;
 }
 #endif
@@ -457,6 +785,8 @@ int main() {
     runTest("shader_cache",             test_shader_cache);
     runTest("pixel_compare_sw_vs_vulkan", test_pixel_compare_backends);
     runTest("memory_manager",           test_memory_manager);
+    runTest("guest_vm_model (pools/GPU VM)", test_guest_vm_model);
+    runTest("page_table_conflicts",     test_page_table_conflicts);
     runTest("png_writer",               test_png_writer);
     runTest("png_rejects_bad_input",    test_png_rejects_bad_input);
     runTest("rasterizer",               test_rasterizer);
@@ -466,6 +796,14 @@ int main() {
     runTest("guest_hello (threads/TLS/sync)", test_guest_hello);
     runTest("guest_worker_exit (flaw-1 regression)", test_guest_worker_exit);
     runTest("guest_cube (GPU pipeline)",      test_guest_cube);
+    runTest("guest_abi_probe (thunk arity suite)", test_guest_abi_probe);
+    runTest("guest_equeue (EQUEUE)",          test_guest_equeue);
+    runTest("guest_fs_demo (VFS + app0)",     test_guest_fs_demo);
+    runTest("guest_syscall_probe (containment)", test_guest_syscall_probe);
+    runTest("guest_cube_vm (GPU-VA draws)",   test_guest_cube_vm);
+    runTest("loader_et_exec (absolute vaddrs)", test_loader_et_exec_static);
+    runTest("loader_dyn_offset (non-zero lo)",  test_loader_dyn_offset_static);
+    runTest("loader_irelative_relro",           test_loader_irelative_relro);
 #endif
 
     std::printf("\n%d passed, %d failed\n", g_passed, g_failed);

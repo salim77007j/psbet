@@ -19,6 +19,9 @@
 
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/vfs.h"
+#include "core/syscall_trap.h"
+#include "psbet/psb_guest_api.h"
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -58,6 +61,7 @@ struct ThreadRec {
     i32           retVal = 0;
     bool          started = false;
     bool          finished = false;
+    bool          parked = false;   // Windows recorded-exit park (never unwound)
 };
 
 struct MutexRec { std::recursive_mutex mtx; };
@@ -69,10 +73,20 @@ struct SemaRec {
 };
 struct CondRec { std::condition_variable_any cv; };
 
+// EQUEUE (v1.2): a wakeable event queue. Producers push; WaitEqueue pops one
+// pending event; every wait wakes on process exit / shutdown.
+struct EqueueRec {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<PsbEqueueEvent> pending;
+    std::string name;
+};
+
 thread_local std::map<u64, std::vector<u8>> g_tlsBlocks;
 thread_local bool   g_inGuestThread = false;
 thread_local bool   g_threadExitEnvValid = false;
 thread_local i32    g_pendingRetVal = 0;
+thread_local ThreadRec* g_selfThread = nullptr;  // this thread's kernel record
 
 // Each guest thread gets its own exit env so sceKernelExitThread can unwind
 // only that thread. Buffer is per-thread; used solely inside its own thread.
@@ -120,6 +134,25 @@ void requestShutdown() {
 }
 
 bool shutdownRequested() { return g_shutdown.load(); }
+
+i32 runGuestMainCooperative(void* entry, bool* done) {
+    g_inGuestThread = true;
+    g_pendingRetVal = 0;
+    g_selfThread = nullptr;   // the guest main is not a tracked ThreadRec
+    installThreadTls();       // syscall trap + TLS on this guest thread only
+    if (setjmp(g_threadExitEnv.buf) == 0) {
+        g_threadExitEnvValid = true;
+        PsbThreadEntry fn = reinterpret_cast<PsbThreadEntry>(entry);
+        fn(0, nullptr);       // natural return or ExitThread unwind
+    }
+    g_threadExitEnvValid = false;
+    g_inGuestThread = false;
+    if (done) *done = true;
+    // The caller (supervisor) uses the recorded process exit code whenever
+    // an exit was requested; a natural return with no exit is code 0.
+    KernelState& k = KernelState::get();
+    return k.exitRequested() ? k.exitCode() : g_pendingRetVal;
+}
 
 bool isSupervisorThread() { return g_isSupervisor; }
 
@@ -195,6 +228,10 @@ void* KernelState::tlsGetAddr(PsbTlsIndex* idx) {
 }
 
 void installThreadTls() {
+    // Raw-syscall containment: every thread that executes guest code gets
+    // the seccomp trap (Linux) — main supervisor thread and workers alike.
+    syscall_trap::installOnCurrentThread(KernelState::get().syscallTrapMode());
+
     PsbTlsIndex idx{1, 0};
     (void)KernelState::get().tlsGetAddr(&idx); // force per-thread block creation
 }
@@ -251,58 +288,71 @@ i32  KernelState::exitCode() const      { return exitCode_; }
 
 void KernelState::shutdownThreads() {
     requestShutdown(); // wake every primitive blocked in this process
-    std::vector<std::shared_ptr<ThreadRec>> stragglers;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (size_t i = 0; i < handles_.size(); ++i) {
-            if (handleKinds_[i] != "thread") continue;
-            auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
-            if (!rec->thread.joinable()) continue;
-            if (rec->finished) continue;          // joined below in one pass
-        }
-    }
+    ThreadStats stats;
 
-    // One join pass for finished threads, then a bounded cooperative grace
-    // for the rest (they were woken by requestShutdown).
+    // Join every finished thread; give running ones a bounded cooperative
+    // grace (they were woken by requestShutdown).
     const auto deadline = std::chrono::steady_clock::now()
                         + std::chrono::milliseconds(200);
-    for (;;) {
-        bool allDone = true;
-        std::vector<std::shared_ptr<ThreadRec>> stillRunning;
+    bool allDone = false;
+    while (!allDone && std::chrono::steady_clock::now() <= deadline) {
+        allDone = true;
+        std::vector<std::shared_ptr<ThreadRec>> batch;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             for (size_t i = 0; i < handles_.size(); ++i) {
                 if (handleKinds_[i] != "thread") continue;
                 auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
-                if (!rec->thread.joinable()) continue;
-                if (rec->finished || std::chrono::steady_clock::now() > deadline) {
-                    stillRunning.push_back(rec);
-                } else {
+                if (rec->thread.joinable() && rec->finished && !rec->parked)
+                    batch.push_back(rec);
+                if (rec->thread.joinable() && !rec->finished && !rec->parked)
                     allDone = false;
-                    stillRunning.push_back(rec);
-                }
             }
         }
-        for (auto& rec : stillRunning) {
-            if (rec->finished && rec->thread.joinable()) rec->thread.join();
+        for (auto& rec : batch) {
+            if (rec->thread.joinable()) { rec->thread.join(); ++stats.joined; }
         }
-        if (allDone || std::chrono::steady_clock::now() > deadline) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (!allDone) std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    // Anything still running after the grace period is detached (logged).
-    // Compute-bound guest code cannot be preempted portably; this is the
-    // documented best-effort boundary.
+    // Phase-3 acceptance: zero force-detached threads on the POSIX path.
+    // Anything still running after the grace period is a real straggler —
+    // detach (loudly) and account it. Windows recorded-exit parks are never
+    // counted as stragglers: they are joinable-dead threads detached quietly
+    // with their own accounting line.
     std::lock_guard<std::mutex> lk(mtx_);
     for (size_t i = 0; i < handles_.size(); ++i) {
         if (handleKinds_[i] != "thread") continue;
         auto rec = std::static_pointer_cast<ThreadRec>(handles_[i]);
-        if (rec->thread.joinable() && !rec->finished) {
-            LOG_WARN("kernel: guest thread '%s' still running at shutdown — detaching",
-                     rec->name.c_str());
+        if (!rec->thread.joinable()) continue;
+        if (rec->parked) {
+            LOG_DEBUG("kernel: parked guest thread '%s' detached (recorded exit)",
+                      rec->name.c_str());
             rec->thread.detach();
+            ++stats.parked;
+        } else if (!rec->finished) {
+            LOG_WARN("kernel: guest thread '%s' still running at shutdown — "
+                     "force-detaching (teardown leak)", rec->name.c_str());
+            rec->thread.detach();
+            ++stats.detached;
         }
     }
+    threadStats_ = stats;
+}
+
+kernel::ThreadStats KernelState::lastThreadStats() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return threadStats_;
+}
+
+void KernelState::setSyscallTrapMode(syscall_trap::Mode m) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    trapMode_ = m;
+}
+
+syscall_trap::Mode KernelState::syscallTrapMode() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return trapMode_;
 }
 
 void KernelState::setProcessStart(u64 us) {
@@ -322,31 +372,133 @@ u64 KernelState::processTimeUs() const {
 extern "C" {
 
 // ---- memory ---------------------------------------------------------------
+// Phase-3 faithful model: typed pools honour search ranges, map is tracked by
+// page tables, free is refcount-guarded, and the GPU owns its own VA space.
+// See guest_vm.h for the model and GUEST_ABI §5 for guest-visible semantics.
+static vm::Prot protFromBits(int prot) {
+    vm::Prot p = vm::Prot::NoAccess;
+    if (prot & PSB_PROT_READ)  p = static_cast<vm::Prot>(static_cast<u32>(p) | static_cast<u32>(vm::Prot::ReadOnly));
+    if (prot & PSB_PROT_WRITE) p = static_cast<vm::Prot>(static_cast<u32>(p) | static_cast<u32>(vm::Prot::Write));
+    if (prot & PSB_PROT_EXEC)  p = static_cast<vm::Prot>(static_cast<u32>(p) | static_cast<u32>(vm::Prot::Exec));
+    return p;
+}
+
 int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd,
                                       size_t len, size_t alignment,
                                       int memoryType, int64_t* physAddrOut) {
-    (void)searchStart; (void)searchEnd; (void)memoryType;
     KernelState& k = KernelState::get();
     if (!physAddrOut || len == 0) return -1;
-    u64 addr = k.memory()->allocate(len, alignment ? alignment : 1,
-                                    "direct-memory", vm::Prot::ReadWrite);
-    if (!addr) return -1; // Phase 3: typed memory pools
-    *physAddrOut = static_cast<int64_t>(addr);
+    u32 pool = GuestMemory::kPoolRegular;
+    if (memoryType == 1) pool = GuestMemory::kPoolGpuVisible;
+    else if (memoryType != 0)
+        LOG_WARN("kernel: memoryType %d mapped to the regular pool", memoryType);
+    const u64 pa = k.memory()->guest().allocDirect(
+        pool, len, alignment ? alignment : 1,
+        static_cast<u64>(searchStart), static_cast<u64>(searchEnd),
+        "guest-direct");
+    if (!pa) return -1;
+    *physAddrOut = static_cast<int64_t>(pa);
+    return 0;
+}
+
+int32_t sceKernelFreeDirectMemory(int64_t physAddr, size_t len) {
+    KernelState& k = KernelState::get();
+    if (physAddr <= 0 || len == 0) return -1;
+    return k.memory()->guest().freeDirect(static_cast<u64>(physAddr), len) ? 0 : -1;
+}
+
+static int32_t mapDirectImpl(void** addrOut, size_t len, int prot, int flags,
+                             int64_t physAddr, const char* name) {
+    KernelState& k = KernelState::get();
+    if (!addrOut || len == 0 || physAddr <= 0) return -1;
+    const u64 pa = static_cast<u64>(physAddr);
+    const u64 va = k.memory()->guest().mapDirect(pa, len, protFromBits(prot), name);
+    if (!va) return -1;
+    if (flags & PSB_MAP_FIXED) {
+        // Identity model: a fixed CPU VA must be exactly arena+PA.
+        const u64 want = *reinterpret_cast<u64*>(addrOut);
+        if (want != va) {
+            LOG_ERROR("kernel: fixed CPU map refused — guest asked 0x%llx, "
+                      "identity mapping is 0x%llx (CPU VA!=PA remapping is "
+                      "not supported in v1.2; see GUEST_ABI §5)",
+                      static_cast<unsigned long long>(want),
+                      static_cast<unsigned long long>(va));
+            k.memory()->guest().unmap(va, len);
+            return -1;
+        }
+    }
+    *addrOut = reinterpret_cast<void*>(va);
     return 0;
 }
 
 int32_t sceKernelMapDirectMemory(void** addrOut, size_t len, int prot, int flags,
                                  int64_t physAddr, size_t pageSizeArg) {
-    (void)len; (void)prot; (void)flags; (void)pageSizeArg;
-    if (!addrOut || physAddr <= 0) return -1;
-    // Unified address space (Phase 1): direct memory is already CPU-visible.
-    *addrOut = reinterpret_cast<void*>(static_cast<u64>(physAddr));
-    return 0;
+    (void)pageSizeArg;
+    return mapDirectImpl(addrOut, len, prot, flags, physAddr, "guest-map");
+}
+
+int32_t sceKernelMapNamedDirectMemory(void** addrOut, size_t len, int prot,
+                                      int flags, int64_t physAddr,
+                                      size_t pageSize, const char* name) {
+    (void)pageSize;
+    return mapDirectImpl(addrOut, len, prot, flags, physAddr,
+                         name ? name : "guest-named-map");
 }
 
 int32_t sceKernelGetDirectMemorySize(size_t* out) {
     if (!out) return -1;
     *out = static_cast<size_t>(MemoryManager::kArenaSize);
+    return 0;
+}
+
+int32_t sceKernelMmap(void** addrOut, size_t len, int prot, int flags,
+                      int32_t fd, int64_t offset) {
+    if (fd >= 0 || offset != 0) {
+        LOG_WARN("kernel: Mmap of fd-backed memory is not supported in v1.2 "
+                 "(anonymous only)");
+        return -1;
+    }
+    (void)flags;
+    KernelState& k = KernelState::get();
+    if (!addrOut || len == 0) return -1;
+    const u64 pa = k.memory()->guest().allocDirect(
+        GuestMemory::kPoolRegular, len, 0x1000, 0, 0, "guest-anon");
+    if (!pa) return -1;
+    const u64 va = k.memory()->guest().mapDirect(pa, len, protFromBits(prot),
+                                                 "guest-anon");
+    if (!va) {
+        k.memory()->guest().freeDirect(pa, len);
+        return -1;
+    }
+    *addrOut = reinterpret_cast<void*>(va);
+    return 0;
+}
+
+int32_t sceKernelMunmap(void* addr, size_t len) {
+    if (!addr || len == 0) return -1;
+    KernelState& k = KernelState::get();
+    const u64 va = reinterpret_cast<u64>(addr);
+    GuestMemory::BlockInfo info;
+    if (!k.memory()->guest().queryVa(va, &info) || info.len != len)
+        return -1;
+    if (!k.memory()->guest().unmap(va, len)) return -1;
+    return k.memory()->guest().freeDirect(info.pa, len) ? 0 : -1;
+}
+
+int32_t sceKernelQueryMemoryProtection(void* addr, void** startOut,
+                                       void** endOut, int32_t* protOut) {
+    if (!addr || !startOut || !endOut || !protOut) return -1;
+    KernelState& k = KernelState::get();
+    GuestMemory::BlockInfo info;
+    if (!k.memory()->guest().queryVa(reinterpret_cast<u64>(addr), &info))
+        return -1;
+    *startOut = reinterpret_cast<void*>(info.va);
+    *endOut = reinterpret_cast<void*>(info.va + info.len);
+    int p = 0;
+    if (static_cast<u32>(info.prot) & static_cast<u32>(vm::Prot::ReadOnly)) p |= PSB_PROT_READ;
+    if (static_cast<u32>(info.prot) & static_cast<u32>(vm::Prot::Write))    p |= PSB_PROT_WRITE;
+    if (static_cast<u32>(info.prot) & static_cast<u32>(vm::Prot::Exec))     p |= PSB_PROT_EXEC;
+    *protOut = p;
     return 0;
 }
 
@@ -413,6 +565,7 @@ int32_t sceKernelStartThread(int32_t tid, size_t arglen, void* argp) {
     raw->thread = std::thread([raw]() {
         g_inGuestThread = true;
         g_pendingRetVal = 0;
+        g_selfThread = raw;
         installThreadTls();
         if (setjmp(g_threadExitEnv.buf) == 0) {
             g_threadExitEnvValid = true;
@@ -424,6 +577,7 @@ int32_t sceKernelStartThread(int32_t tid, size_t arglen, void* argp) {
         }
         // Reached via sceKernelExitThread longjmp or natural return.
         g_threadExitEnvValid = false;
+        g_selfThread = nullptr;
         raw->retVal = g_pendingRetVal;
         raw->finished = true;
     });
@@ -444,19 +598,43 @@ int32_t sceKernelWaitThreadEnd(int32_t tid, int32_t* retVal, uint64_t* timeoutUs
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
-        rec->thread.join();
+        // Windows recorded-exit parks leave the OS thread alive on purpose
+        // (MSVC SEH cannot unwind GCC guest frames). They are detached at
+        // teardown; joining them here would deadlock forever.
+        if (!rec->parked) rec->thread.join();
     }
     if (retVal) *retVal = rec->retVal;
     return 0;
 }
 
 void sceKernelExitThread(int32_t retVal) {
-    if (!g_inGuestThread || !g_threadExitEnvValid) {
+    if (!g_inGuestThread) {
         LOG_WARN("kernel: ExitThread outside a guest thread — ignoring");
+        return;
+    }
+#if defined(_WIN32)
+    // Windows hosting model: a longjmp from a GCC-compiled guest frame
+    // triggers STATUS_INVALID_DISPATCH under MSVC SEH (Phase-2 discovery).
+    // Record the result, mark the thread finished (WaitThreadEnd returns
+    // immediately without joining) and park — never unwinding guest frames.
+    if (g_selfThread) {
+        g_selfThread->retVal = retVal;
+        g_selfThread->finished = true;
+        g_selfThread->parked = true;
+        g_selfThread = nullptr;
+    }
+    LOG_DEBUG("kernel: ExitThread(%d) — Windows record+park", retVal);
+    std::unique_lock<std::mutex> lk(g_wakeMtx);
+    g_wakeCv.wait(lk, [] { return shutdownRequested(); });
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+#else
+    if (!g_threadExitEnvValid) {
+        LOG_WARN("kernel: ExitThread outside guest frames — ignoring");
         return;
     }
     g_pendingRetVal = retVal;
     longjmp(g_threadExitEnv.buf, 1);
+#endif
 }
 
 int32_t sceKernelGetThreadId(void) {
@@ -576,63 +754,204 @@ int32_t sceKernelSignalCondAll(int32_t condId) {
     return 0;
 }
 
+// ---- event queues (EQUEUE v1.2) --------------------------------------------
+int32_t sceKernelCreateEqueue(const char* name, int32_t* out) {
+    if (!name || !out) return -1;
+    auto rec = std::make_shared<EqueueRec>();
+    rec->name = name;
+    *out = KernelState::get().addHandle(rec, "equeue");
+    LOG_DEBUG("kernel: equeue '%s' created (id=%d)", name, *out);
+    return 0;
+}
+
+int32_t sceKernelDeleteEqueue(int32_t eqId) {
+    auto rec = std::static_pointer_cast<EqueueRec>(
+        KernelState::get().getHandle(eqId, "equeue"));
+    if (!rec) return -1;
+    {
+        std::lock_guard<std::mutex> lk(rec->mtx);
+        rec->pending.clear();
+    }
+    rec->cv.notify_all();
+    return 0;
+}
+
+int32_t sceKernelAddEvent(int32_t eqId, uint64_t ident, uint32_t flags,
+                          uint64_t userData) {
+    auto rec = std::static_pointer_cast<EqueueRec>(
+        KernelState::get().getHandle(eqId, "equeue"));
+    if (!rec) return -1;
+    {
+        std::lock_guard<std::mutex> lk(rec->mtx);
+        rec->pending.push_back({ident, flags, userData});
+    }
+    rec->cv.notify_all();
+    return 0;
+}
+
+int32_t sceKernelTriggerEvent(int32_t eqId, uint64_t ident, uint32_t flags,
+                              uint64_t userData) {
+    // v1.2 semantics: TriggerEvent is the kernel-side signal path — identical
+    // observable effect to AddEvent (documented in GUEST_ABI §7).
+    return sceKernelAddEvent(eqId, ident, flags, userData);
+}
+
+int32_t sceKernelWaitEqueue(int32_t eqId, PsbEqueueEvent* eventOut,
+                            uint64_t timeoutUs) {
+    auto rec = std::static_pointer_cast<EqueueRec>(
+        KernelState::get().getHandle(eqId, "equeue"));
+    if (!rec || !eventOut) return -1;
+    std::unique_lock<std::mutex> lk(rec->mtx);
+    const auto pred = [&] { return !rec->pending.empty(); };
+    bool got = false;
+    if (timeoutUs == 0) {
+        got = wakeableWait(lk, rec->cv, pred);
+    } else {
+        const auto until = std::chrono::steady_clock::now()
+                         + std::chrono::microseconds(timeoutUs);
+        while (!pred()) {
+            if (KernelState::get().exitRequested() || shutdownRequested()) break;
+            if (rec->cv.wait_until(lk, until) == std::cv_status::timeout) break;
+        }
+        got = pred();
+    }
+    if (!got) return -1; // timeout or exit/shutdown wake
+    *eventOut = rec->pending.front();
+    rec->pending.erase(rec->pending.begin());
+    return 0;
+}
+
+int32_t sceKernelCancelEvent(int32_t eqId, uint64_t ident) {
+    auto rec = std::static_pointer_cast<EqueueRec>(
+        KernelState::get().getHandle(eqId, "equeue"));
+    if (!rec) return -1;
+    std::lock_guard<std::mutex> lk(rec->mtx);
+    auto& v = rec->pending;
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](const PsbEqueueEvent& e) { return e.ident == ident; }),
+            v.end());
+    return 0;
+}
+
 // ---- I/O ------------------------------------------------------------------
-// Phase-1 console-interleaving flaw fixed: guest writes share the engine's
-// console mutex and flush at each write, so lines never interleave mid-line
-// between guest stdout and host stderr logging.
+// Phase-3: the guest filesystem is virtualized (vfs.h). Guests never touch
+// the host filesystem except through the /data passthrough mount. Console
+// writes (fds 0/1/2) keep the serialized, flushed path.
 int64_t sceKernelWrite(int32_t fd, const void* buf, size_t n) {
     if (!buf) return -1;
-    std::lock_guard<std::mutex> lk(g_consoleMtx);
+    if (fd == 0 || fd == 1 || fd == 2) {
+        std::lock_guard<std::mutex> lk(g_consoleMtx);
 #if !defined(_WIN32)
-    const ssize_t r = ::write(fd, buf, n);
-    if (fd == 1 || fd == 2) ::fsync(fd); // flush ordering vs host logging
-    return static_cast<int64_t>(r);
+        const ssize_t r = ::write(fd, buf, n);
+        if (fd == 1 || fd == 2) ::fsync(fd); // flush ordering vs host logging
+        return static_cast<int64_t>(r);
 #else
-    HANDLE h = fd == 1 ? GetStdHandle(STD_OUTPUT_HANDLE)
-                       : fd == 2 ? GetStdHandle(STD_ERROR_HANDLE) : nullptr;
-    if (!h || h == INVALID_HANDLE_VALUE) return -1;
-    DWORD written = 0;
-    if (!WriteFile(h, buf, static_cast<DWORD>(n), &written, nullptr)) return -1;
-    return static_cast<int64_t>(written);
+        HANDLE h = fd == 1 ? GetStdHandle(STD_OUTPUT_HANDLE)
+                           : fd == 2 ? GetStdHandle(STD_ERROR_HANDLE) : nullptr;
+        if (!h || h == INVALID_HANDLE_VALUE) return -1;
+        DWORD written = 0;
+        if (!WriteFile(h, buf, static_cast<DWORD>(n), &written, nullptr)) return -1;
+        return static_cast<int64_t>(written);
 #endif
+    }
+    return vfs::write(fd, buf, n);
 }
 
 int64_t sceKernelRead(int32_t fd, void* buf, size_t n) {
+    if (!buf) return -1;
+    if (fd == 0) {
 #if !defined(_WIN32)
-    return ::read(fd, buf, n);
+        return ::read(fd, buf, n);
 #else
-    (void)fd; (void)buf; (void)n;
-    return -1; // stdin reads arrive with the SDL input phase
+        return -1; // stdin reads arrive with the SDL input phase
 #endif
+    }
+    if (fd == 1 || fd == 2) return -1;
+    return vfs::read(fd, buf, n);
 }
 
 int32_t sceKernelOpen(const char* path, int32_t flags, uint32_t mode) {
-#if !defined(_WIN32)
-    return ::open(path, flags, static_cast<mode_t>(mode));
-#else
-    // Map the common guest flag subset to _open (read/write/create).
-    int m = _O_BINARY;
-    if (flags & 0x1) m |= _O_WRONLY;                 // O_WRONLY (subset bit)
-    else if (flags & 0x2) m |= _O_RDWR;              // O_RDWR
-    else m |= _O_RDONLY;
-    if (flags & 0x40) m |= _O_CREAT;                 // O_CREAT
-    if (flags & 0x200) m |= _O_TRUNC;                // O_TRUNC
-    return ::_open(path, m, static_cast<int>(mode));
-#endif
+    (void)mode; // POSIX 0777 semantics; the VFS layer decides what applies
+    if (!path) return -1;
+    return vfs::open(path, static_cast<u32>(flags));
 }
 
 int32_t sceKernelClose(int32_t fd) {
-#if !defined(_WIN32)
-    return ::close(fd);
-#else
-    return ::_close(fd);
-#endif
+    if (fd >= 0 && fd <= 2) return 0; // std streams live for the process
+    return vfs::close(fd);
+}
+
+int64_t sceKernelLseek(int32_t fd, int64_t offset, int32_t whence) {
+    if (fd >= 0 && fd <= 2) return -1;
+    return vfs::lseek(fd, offset, whence);
+}
+
+int32_t sceKernelFstat(int32_t fd, PsbStat* out) {
+    if (!out || (fd >= 0 && fd <= 2)) return -1;
+    vfs::FileStat st;
+    if (!vfs::stat(fd, &st)) return -1;
+    out->size = st.size;
+    out->isDir = st.isDir ? 1u : 0u;
+    out->readOnly = st.readOnly ? 1u : 0u;
+    return 0;
 }
 
 // ---- misc -----------------------------------------------------------------
 int32_t sceKernelIsNeoMode(void) {
     return 0; // base model
 }
+
+// ---- ABI conformance probes (Phase 3) --------------------------------------
+// Deterministic argument-position checks used by the Windows SysV->Win64
+// conformance suite (tests/homebrew/abi_probe.c). Each argument position is
+// folded into the result with a distinct XOR constant and rotation, so any
+// mis-routed register/stack slot is detectable. Present on every platform;
+// on POSIX they pass trivially, on Windows they execute through the MASM
+// thunks and would have caught the thunk3 arg2-loss bug.
+namespace {
+inline u64 psbRotl64(u64 x, unsigned r) { return (x << r) | (x >> (64 - r)); }
+}
+
+extern "C" {
+
+uint64_t psbProbeCall1(uint64_t a) {
+    return a ^ 0xA5u;
+}
+
+uint64_t psbProbeCall2(uint64_t a, uint64_t b) {
+    return psbRotl64(a ^ 0xA5u, 7) ^ (b ^ 0x5Au);
+}
+
+uint64_t psbProbeCall3(uint64_t a, uint64_t b, uint64_t c) {
+    return psbRotl64(psbRotl64(a ^ 0xA5u, 7) ^ (b ^ 0x5Au), 9) ^ (c ^ 0x33u);
+}
+
+uint64_t psbProbeCall4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return psbRotl64(psbRotl64(psbRotl64(a ^ 0xA5u, 7) ^ (b ^ 0x5Au), 9)
+                     ^ (c ^ 0x33u), 11) ^ (d ^ 0x99u);
+}
+
+uint64_t psbProbeCall5(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                       uint64_t e) {
+    return psbRotl64(psbRotl64(psbRotl64(psbRotl64(a ^ 0xA5u, 7) ^ (b ^ 0x5Au), 9)
+                               ^ (c ^ 0x33u), 11) ^ (d ^ 0x99u), 13)
+         ^ (e ^ 0xC3u);
+}
+
+uint64_t psbProbeCall6(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                       uint64_t e, uint64_t f) {
+    return psbRotl64(psbRotl64(psbRotl64(psbRotl64(psbRotl64(a ^ 0xA5u, 7)
+                     ^ (b ^ 0x5Au), 9) ^ (c ^ 0x33u), 11) ^ (d ^ 0x99u), 13)
+                     ^ (e ^ 0xC3u), 17) ^ (f ^ 0x3Cu);
+}
+
+int32_t psbProbePtr2(void* out, uint64_t val) {
+    if (!out) return -1;
+    *reinterpret_cast<uint64_t*>(out) = val ^ 0x77u;
+    return 0x1234;
+}
+
+} // extern "C" (ABI probes)
 
 // ---- Windows ABI trampoline targets ---------------------------------------
 // Guests call these through SysV->Win64 thunks (w64_thunks.asm): the thunk
@@ -703,8 +1022,48 @@ int32_t  psbXSysOpen(const char* a, int32_t b, uint32_t c)
     { return sceKernelOpen(a, b, c); }
 int32_t  psbXSysClose(int32_t a)
     { return sceKernelClose(a); }
+int64_t  psbXSysLseek(int32_t a, int64_t b, int32_t c)
+    { return sceKernelLseek(a, b, c); }
+int32_t  psbXSysFstat(int32_t a, PsbStat* b)
+    { return sceKernelFstat(a, b); }
+int32_t  psbXSysFreeDirectMemory(int64_t a, size_t b)
+    { return sceKernelFreeDirectMemory(a, b); }
+int32_t  psbXSysMapNamedDirectMemory(void** a, size_t b, int c, int d, int64_t e, size_t f, const char* g)
+    { return sceKernelMapNamedDirectMemory(a, b, c, d, e, f, g); }
+int32_t  psbXSysMmap(void** a, size_t b, int c, int d, int32_t e, int64_t f)
+    { return sceKernelMmap(a, b, c, d, e, f); }
+int32_t  psbXSysMunmap(void* a, size_t b)
+    { return sceKernelMunmap(a, b); }
+int32_t  psbXSysQueryMemoryProtection(void* a, void** b, void** c, int32_t* d)
+    { return sceKernelQueryMemoryProtection(a, b, c, d); }
+int32_t  psbXSysCreateEqueue(const char* a, int32_t* b)
+    { return sceKernelCreateEqueue(a, b); }
+int32_t  psbXSysDeleteEqueue(int32_t a)
+    { return sceKernelDeleteEqueue(a); }
+int32_t  psbXSysAddEvent(int32_t a, uint64_t b, uint32_t c, uint64_t d)
+    { return sceKernelAddEvent(a, b, c, d); }
+int32_t  psbXSysTriggerEvent(int32_t a, uint64_t b, uint32_t c, uint64_t d)
+    { return sceKernelTriggerEvent(a, b, c, d); }
+int32_t  psbXSysWaitEqueue(int32_t a, PsbEqueueEvent* b, uint64_t c)
+    { return sceKernelWaitEqueue(a, b, c); }
+int32_t  psbXSysCancelEvent(int32_t a, uint64_t b)
+    { return sceKernelCancelEvent(a, b); }
 int32_t  psbXSysIsNeoMode(void)
     { return sceKernelIsNeoMode(); }
+uint64_t psbXProbeCall1(uint64_t a)
+    { return psbProbeCall1(a); }
+uint64_t psbXProbeCall2(uint64_t a, uint64_t b)
+    { return psbProbeCall2(a, b); }
+uint64_t psbXProbeCall3(uint64_t a, uint64_t b, uint64_t c)
+    { return psbProbeCall3(a, b, c); }
+uint64_t psbXProbeCall4(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+    { return psbProbeCall4(a, b, c, d); }
+uint64_t psbXProbeCall5(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
+    { return psbProbeCall5(a, b, c, d, e); }
+uint64_t psbXProbeCall6(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f)
+    { return psbProbeCall6(a, b, c, d, e, f); }
+int32_t  psbXProbePtr2(void* a, uint64_t b)
+    { return psbProbePtr2(a, b); }
 void*    psbXTlsGetAddr(PsbTlsIndex* a)
     { return psbTlsGetAddr(a); }
 void     psbXCxaFinalize(void* a)
@@ -746,7 +1105,13 @@ int32_t psbGetRuntimeVersion(void) {
 }
 
 const char* psbGetRuntimeName(void) {
-    return "PSBET 0.1.0 (clean-room PS5 runtime)";
+    static const char* name = [] {
+        static char buf[64];
+        std::snprintf(buf, sizeof(buf), "PSBET %u.%u.%u (clean-room PS5 runtime)",
+                      kVersionMajor, kVersionMinor, kVersionPatch);
+        return buf;
+    }();
+    return name;
 }
 
 } // extern "C"
@@ -776,10 +1141,21 @@ void psbTWinCreateCond(void);            void psbTWinWaitCond(void);
 void psbTWinSignalCond(void);            void psbTWinSignalCondAll(void);
 void psbTWinWrite(void);                 void psbTWinRead(void);
 void psbTWinOpen(void);                  void psbTWinClose(void);
+void psbTWinLseek(void);                 void psbTWinFstat(void);
+void psbTWinFreeDirectMemory(void);      void psbTWinMapNamedDirectMemory(void);
+void psbTWinMmap(void);                  void psbTWinMunmap(void);
+void psbTWinQueryMemoryProtection(void);
+void psbTWinCreateEqueue(void);          void psbTWinDeleteEqueue(void);
+void psbTWinAddEvent(void);              void psbTWinTriggerEvent(void);
+void psbTWinWaitEqueue(void);            void psbTWinCancelEvent(void);
 void psbTWinIsNeoMode(void);             void psbTWinTlsGetAddr(void);
 void psbTWinCxaFinalize(void);           void psbTWinGetRuntimeVersion(void);
 void psbTWinGetRuntimeName(void);        void psbTWinGnmSubmit(void);
 void psbTWinStackChkFail(void);
+void psbTWinProbeCall1(void);            void psbTWinProbeCall2(void);
+void psbTWinProbeCall3(void);            void psbTWinProbeCall4(void);
+void psbTWinProbeCall5(void);            void psbTWinProbeCall6(void);
+void psbTWinProbePtr2(void);
 }
 #define W(name) psbTWin##name
 const Export kExports[] = {
@@ -811,12 +1187,32 @@ const Export kExports[] = {
     {"sceKernelRead",                 (void*)&W(Read)},
     {"sceKernelOpen",                 (void*)&W(Open)},
     {"sceKernelClose",                (void*)&W(Close)},
+    {"sceKernelLseek",                (void*)&W(Lseek)},
+    {"sceKernelFstat",                (void*)&W(Fstat)},
+    {"sceKernelFreeDirectMemory",     (void*)&W(FreeDirectMemory)},
+    {"sceKernelMapNamedDirectMemory", (void*)&W(MapNamedDirectMemory)},
+    {"sceKernelMmap",                 (void*)&W(Mmap)},
+    {"sceKernelMunmap",               (void*)&W(Munmap)},
+    {"sceKernelQueryMemoryProtection",(void*)&W(QueryMemoryProtection)},
+    {"sceKernelCreateEqueue",         (void*)&W(CreateEqueue)},
+    {"sceKernelDeleteEqueue",         (void*)&W(DeleteEqueue)},
+    {"sceKernelAddEvent",             (void*)&W(AddEvent)},
+    {"sceKernelTriggerEvent",         (void*)&W(TriggerEvent)},
+    {"sceKernelWaitEqueue",           (void*)&W(WaitEqueue)},
+    {"sceKernelCancelEvent",          (void*)&W(CancelEvent)},
     {"sceKernelIsNeoMode",            (void*)&W(IsNeoMode)},
     {"__stack_chk_fail",              (void*)&W(StackChkFail)},
     {"__tls_get_addr",                (void*)&W(TlsGetAddr)},
     {"__cxa_finalize",                (void*)&W(CxaFinalize)},
     {"psbGetRuntimeVersion",          (void*)&W(GetRuntimeVersion)},
     {"psbGetRuntimeName",             (void*)&W(GetRuntimeName)},
+    {"psbProbeCall1",                 (void*)&W(ProbeCall1)},
+    {"psbProbeCall2",                 (void*)&W(ProbeCall2)},
+    {"psbProbeCall3",                 (void*)&W(ProbeCall3)},
+    {"psbProbeCall4",                 (void*)&W(ProbeCall4)},
+    {"psbProbeCall5",                 (void*)&W(ProbeCall5)},
+    {"psbProbeCall6",                 (void*)&W(ProbeCall6)},
+    {"psbProbePtr2",                  (void*)&W(ProbePtr2)},
 };
 #undef W
 #else
@@ -849,12 +1245,32 @@ const Export kExports[] = {
     {"sceKernelRead",                 (void*)&sceKernelRead},
     {"sceKernelOpen",                 (void*)&sceKernelOpen},
     {"sceKernelClose",                (void*)&sceKernelClose},
+    {"sceKernelLseek",                (void*)&sceKernelLseek},
+    {"sceKernelFstat",                (void*)&sceKernelFstat},
+    {"sceKernelFreeDirectMemory",     (void*)&sceKernelFreeDirectMemory},
+    {"sceKernelMapNamedDirectMemory", (void*)&sceKernelMapNamedDirectMemory},
+    {"sceKernelMmap",                 (void*)&sceKernelMmap},
+    {"sceKernelMunmap",               (void*)&sceKernelMunmap},
+    {"sceKernelQueryMemoryProtection",(void*)&sceKernelQueryMemoryProtection},
+    {"sceKernelCreateEqueue",         (void*)&sceKernelCreateEqueue},
+    {"sceKernelDeleteEqueue",         (void*)&sceKernelDeleteEqueue},
+    {"sceKernelAddEvent",             (void*)&sceKernelAddEvent},
+    {"sceKernelTriggerEvent",         (void*)&sceKernelTriggerEvent},
+    {"sceKernelWaitEqueue",           (void*)&sceKernelWaitEqueue},
+    {"sceKernelCancelEvent",          (void*)&sceKernelCancelEvent},
     {"sceKernelIsNeoMode",            (void*)&sceKernelIsNeoMode},
     {"__stack_chk_fail",              (void*)&psbStackChkFail},
     {"__tls_get_addr",                (void*)&psbTlsGetAddr},
     {"__cxa_finalize",                (void*)&psbCxaFinalize},
     {"psbGetRuntimeVersion",          (void*)&psbGetRuntimeVersion},
     {"psbGetRuntimeName",             (void*)&psbGetRuntimeName},
+    {"psbProbeCall1",                 (void*)&psbProbeCall1},
+    {"psbProbeCall2",                 (void*)&psbProbeCall2},
+    {"psbProbeCall3",                 (void*)&psbProbeCall3},
+    {"psbProbeCall4",                 (void*)&psbProbeCall4},
+    {"psbProbeCall5",                 (void*)&psbProbeCall5},
+    {"psbProbeCall6",                 (void*)&psbProbeCall6},
+    {"psbProbePtr2",                  (void*)&psbProbePtr2},
 };
 #endif // _WIN32
 

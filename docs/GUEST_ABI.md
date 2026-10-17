@@ -1,6 +1,8 @@
-# PSBET Guest ABI v1
+# PSBET Guest ABI v1.2
 
 This document is the normative contract between a guest image and PSBET.
+Phase 3 (v1.2) extends v1 additively: memory model v2, GPU virtual memory,
+EQUEUE, virtualized I/O, raw-syscall containment. v1 guests run unchanged.
 It is clean-room: the names are PS5-style for familiarity, the semantics
 below are PSBET's own definitions, and nothing here derives from Sony code.
 
@@ -14,14 +16,17 @@ A guest is a standard ELF64 image:
 |-------------|------------------------------------------------------|
 | Class/Data  | ELF64, little-endian                                 |
 | Machine     | `EM_X86_64` (62)                                     |
-| Type        | `ET_DYN` (PIE-style; `ET_EXEC` rejected in Phase 1)  |
+| Type        | `ET_DYN` (any layout) or `ET_EXEC` (absolute vaddrs must be free below 8 GiB) |
 | Layout      | First `PT_LOAD` covers file offset 0 **at vaddr 0** (standard PIE) |
 | Entry       | `psb_entry` — a plain SysV function (`void f(void)`) |
 | TLS model   | General-dynamic (`__tls_get_addr`); initial-exec (`R_X86_64_TPOFF64`) is rejected |
 | OSABI       | Any; `ELFOSABI_FREEBSD` (PS5 flavour) accepted       |
 
 Encrypted SELF containers are detected by magic and rejected with guidance —
-PSBET never ships key material (clean-room policy).
+PSBET never ships key material (clean-room policy). Images without a
+`PT_DYNAMIC` load as static-style. `R_X86_64_IRELATIVE` is resolved by
+executing the addend resolver. `PT_GNU_RELRO` regions become read-only after
+relocation. The first `PT_LOAD` may sit at any vaddr (v1 required vaddr 0).
 
 ## 2. Canonical build recipe (GCC/Clang, Linux)
 
@@ -52,9 +57,11 @@ sceKernelWaitThreadEnd(tid, &retVal, 0);   // unbounded in v1
 sceKernelExitThread(retVal);               // unwinds ONLY the calling thread
 ```
 
-Phase 1 notes: priorities are accepted and unused; stacks run on host
-threads (guest stack switching arrives with Phase 3's faithful memory
-model); waits are unbounded.
+Priorities are accepted and unused; waits are unbounded. v1.2 semantics:
+`sceKernelExitThread` and `sceKernelExitProcess` are safe from ANY guest
+thread — each unwinds only the calling thread's own frames (there is no
+cross-thread unwinding anywhere in PSBET since the Phase-3 hosting-model
+unification).
 
 ## 4. TLS
 
@@ -73,10 +80,30 @@ sceKernelAllocateDirectMemory(searchStart, searchEnd, len, alignment,
 sceKernelMapDirectMemory(&addrOut, len, prot, flags, physAddr, pageSize);
 ```
 
-Phase 1 uses a unified address space: allocations are CPU-visible
-immediately and `MapDirectMemory` is identity. `searchStart/searchEnd` and
-`memoryType` are accepted and ignored. This is the main documented
-divergence from real console semantics (typed pools land in Phase 3).
+v1.2 (Phase 3) — the faithful model:
+```c
+sceKernelAllocateDirectMemory(searchStart, searchEnd, len, alignment,
+                              memoryType, &physAddrOut); // typed pools; search range honoured
+sceKernelFreeDirectMemory(physAddr, len);                 // refcount-guarded
+sceKernelMapDirectMemory(&addrOut, len, prot, flags, physAddr, pageSize);
+sceKernelMapNamedDirectMemory(&addrOut, len, prot, flags, physAddr, pageSize, name);
+sceKernelMmap(&addrOut, len, prot, flags, fd, offset);    // anonymous only
+sceKernelMunmap(addr, len);
+sceKernelQueryMemoryProtection(addr, &startOut, &endOut, &protOut);
+sceGnmReserveGpuAddress(len, alignment, fixedGpuVa, &gpuVaOut);
+sceGnmMapGpuAddress(gpuVa, physAddr, len, prot);
+sceGnmUnmapGpuAddress(gpuVa, len);
+```
+* `memoryType`: 0 = regular pool, 1 = GPU-visible pool (other values warn
+  and use the regular pool).
+* CPU mappings are identity (VA = arena + PA) — native-execution model.
+  `PSB_MAP_FIXED` requires the caller's address to equal the identity
+  mapping; VA≠PA CPU remapping is rejected (documented divergence).
+* Protection bits: `PSB_PROT_READ 0x1`, `PSB_PROT_WRITE 0x2`,
+  `PSB_PROT_EXEC 0x4`.
+* The GPU owns a separate virtual address space: reserve a window, map
+  physical pages into it, then reference the GPU-VA from PBFF v1.1 packets
+  (opcode 6). GPU VAs are translated through real page tables per submit.
 
 ## 6. Time
 
@@ -99,15 +126,22 @@ sceKernelCreateCond(name, attr, &id); sceKernelWaitCond(id, mutexId, 0);
 sceKernelSignalCond(id); sceKernelSignalCondAll(id);
 ```
 
-## 8. I/O
+## 8. I/O (v1.2: virtualized filesystem)
 
 ```c
 sceKernelWrite(fd, buf, n); sceKernelRead(fd, buf, n);
 sceKernelOpen(path, flags, mode); sceKernelClose(fd);
+sceKernelLseek(fd, offset, whence);
+typedef struct PsbStat { uint64_t size; uint32_t isDir; uint32_t readOnly; } PsbStat;
+sceKernelFstat(fd, PsbStat* out);
 ```
 
-Thin passthrough to host fds (stdout = 1). Filesystem virtualization is a
-Phase 3 deliverable; guests today see the host filesystem directly.
+Guests never touch the host filesystem. Mounts: `app0:/` — a read-only
+container image (PSBET Archive; pack one with `psbet mkfsa <dir> <out>`,
+mount with `--mount-pfs`); `/data` — a writable host directory
+(`--data-dir`). Paths outside the mounts never resolve. Open flags:
+RDONLY 0x0, WRONLY 0x1, RDWR 0x2, CREATE 0x40, TRUNC 0x200. fds 0/1/2 are
+the host console (serialized).
 
 ## 9. GPU submission
 
@@ -128,7 +162,27 @@ Per submit, PSBET runs the frame hook: capture (PNG at interval), FPS
 accounting, and the safety frame limit (`--frames`; on breach the guest is
 exited with code 124).
 
-## 10. Versioning
+## 10. Raw syscalls (v1.2 containment)
+
+A guest that executes a raw `syscall` instruction would reach the HOST
+kernel — PSBET closes that hatch on Linux: guest threads run under a
+seccomp trap; host-escaping syscalls (exec, fork, sockets, mounts, modules,
+keyrings, ...) are refused with `-EPERM` and logged. Benign syscalls stay
+allowed. On platforms without seccomp the boundary is the emulated import
+surface itself. Guests should always use the `sce*` surface — raw syscalls
+are neither portable nor stable.
+
+## 11. Event queues (v1.2)
+
+```c
+sceKernelCreateEqueue(name, &eq); sceKernelDeleteEqueue(eq);
+sceKernelAddEvent(eq, ident, flags, userData);     // guest-side post
+sceKernelTriggerEvent(eq, ident, flags, userData); // kernel-side signal (same effect in v1.2)
+sceKernelWaitEqueue(eq, &eventOut, timeoutUs);     // 0 = unbounded; wakeable by exit/shutdown
+sceKernelCancelEvent(eq, ident);
+```
+
+## 12. Versioning
 
 `psbGetRuntimeVersion()` packs `major.minor.patch`. ABI v1 will not break
 backward compatibility; additions are additive. Compile against

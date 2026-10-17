@@ -274,3 +274,130 @@ broken host driver can never take the process down or silently corrupt
 output. Risk register addition: llvmpipe JIT faults inside
 `vkCreateGraphicsPipelines` on some sandboxed kernels (observed, contained by
 the self-test; healthy runners/PCs unaffected).
+
+---
+
+## 11. Phase 3 addendum — Orbis OS depth & memory fidelity
+
+### 11.1 Memory model v2 (guest_vm)
+
+```
+physical address space (PSBET PA == arena offset)
+ ┌───────────────────────────────────────────────────────┐ 16 GiB reservation
+ │ page 0: null guard (never allocatable)                │
+ │ [0x1000, 8 GiB)   pool 0: REGULAR (CPU+GPU)           │ free-list per pool,
+ │ [8 GiB, 12 GiB)   pool 1: GPU-VISIBLE                 │ Orbis-style search
+ │ [12 GiB, 16 GiB)  headroom                            │ ranges + coalescing
+ └───────────────────────────────────────────────────────┘
+        │ identity CPU mapping (VA = arena + PA)          │ GPU VM (separate!)
+        ▼                                                 ▼
+ CPU page tables                                   GPU page tables
+ 2-level, 4 KiB leaves under 2 MiB mids            same structure, own VA space
+ PTE: present|prot|PA-frame                        8 GiB window, reserve/map/unmap
+ enforced by host mprotect                         translated per GPU-VA access
+```
+
+Design contract (documented divergence, enforced loudly):
+* PSBET executes guests natively — a guest CPU pointer **is** a host pointer.
+  CPU direct-memory mappings are therefore identity (VA = arena + PA); the
+  *model* beneath (typed pools, search ranges, PTEs, refcounted mappings) is
+  faithful, and the GPU owns a fully separate virtual address space with a
+  real page-table walk (never assumed identity).
+* CPU-side VA≠PA remapping (aliasing one physical allocation at two CPU
+  addresses) is **rejected** in v0.3: it buys nothing until framebuffer
+  aliasing (Phase 5) and would break the native-pointer invariant.
+* PA 0 is a reserved null-guard page: wild null-pointer guests die loudly.
+* `freeDirect` is refcount-guarded — memory in use by any live CPU or GPU
+  mapping cannot be freed (double-map, double-free and use-after-free of
+  direct memory are hard errors, fuzz-locked).
+
+### 11.2 GPU virtual memory (PBFF v1.1)
+
+Guests reserve a GPU-VA window (`sceGnmReserveGpuAddress`), map physical
+allocations into it (`sceGnmMapGpuAddress`), and draw through the mapping:
+PBFF opcode 6 (`DrawTrianglesGpu`) carries only the GPU-VA; the device
+translates the address through the GPU page tables per submit (whole-span
+validation; unmapped or partially-mapped spans reject the buffer). The
+`cube_vm` guest renders the Phase-1 cube entirely through this path —
+screenshots in `docs/screenshots/phase3_cube_vm_*.png`.
+
+### 11.3 Virtualized filesystem (vfs + pfs)
+
+Guests no longer see the host filesystem. The VFS exposes:
+* `app0:/` — a read-only mounted container image. Phase 3 ships the
+  **PSBET Archive (PSA)** format (own clean-room container: header, bounds-
+  checked entry table, name pool, data region) plus a `psbet mkfsa` packer.
+  Encrypted Sony PFS containers remain unsupported (clean-room policy: no
+  key material; the public structural documentation base was insufficient
+  for a verified reader at Phase-3 time — see PHASE_3_REPORT §5).
+* `/data` — a writable passthrough backed by one host directory
+  (`--data-dir`).
+* Everything else — **nothing**. Guest paths outside the mounts return
+  errors; `/etc/passwd` does not exist to a guest. Kernel fds 0/1/2 stay
+  host std streams (serialized console), fds ≥ 3 are VFS-owned.
+
+### 11.4 Raw-syscall containment (syscall_trap)
+
+Native execution means a guest `syscall` instruction reaches the *host*
+kernel — the one escape hatch around the emulated surface. Phase 3 closes it
+on Linux: every thread that executes guest code installs a per-thread
+seccomp filter (SECCOMP_RET_TRAP) over a deny-list of host-escaping syscalls
+(exec/fork, sockets, mounts/namespaces, modules, keyrings, kexec, io_uring,
+bpf, process_vm, ...). Trapped calls raise SIGSYS; PSBET's handler answers
+-EPERM (logged) and resumes the guest. Filters attach to guest threads only
+— engine threads never execute guest code, so host tooling (ASan/LSan) is
+unaffected. On platforms without seccomp the documented fallback is the
+emulated import boundary itself (GUEST_ABI §11).
+
+This forced a hosting-model unification: the guest main now runs on a
+dedicated thread on **both** platforms (previously POSIX ran it on the
+supervisor thread). Benefits beyond containment: zero cross-thread longjmp
+in the codebase (the Phase-1 flaw class is now structurally impossible),
+engine teardown never unwinds through guest frames, and "every thread that
+runs guest code is filtered" is exactly true by construction.
+
+### 11.5 Kernel surface v3 (GUEST_ABI v1.2)
+
+Additions over v1.1: `sceKernelFreeDirectMemory`, `sceKernelMapNamedDirectMemory`,
+`sceKernelMmap`/`sceKernelMunmap` (anonymous), `sceKernelQueryMemoryProtection`,
+`sceKernelLseek`/`sceKernelFstat` (VFS-routed I/O), the EQUEUE set
+(`sceKernelCreateEqueue`/`DeleteEqueue`/`AddEvent`/`TriggerEvent`/
+`WaitEqueue`/`CancelEvent` — wakeable waits, cooperative on exit/shutdown),
+and the GPU VM set (`sceGnmReserveGpuAddress`/`MapGpuAddress`/
+`UnmapGpuAddress`). Teardown accounting is now measured and reported
+(joined / force-detached / parked per run; the CLI prints it, tests assert
+zero force-detached on POSIX).
+
+### 11.6 Windows ABI conformance (the Phase-2 residual, root-caused)
+
+The Phase-2 report tracked a residual "garbled counters → stack scribble →
+AV at exit" on Windows. Root cause found by code inspection in Phase 3:
+`w64_thunks.asm` `thunk3` executed `mov r8, rdx` **after** `mov rdx, rsi`
+had clobbered rdx — every 3-argument guest→host call delivered arg1 twice
+and lost arg2 (`sceKernelStartThread` got a garbage argp, `sceKernelWrite`
+a garbage length, `sceKernelCreateCond` wrote its handle through a garbage
+out-pointer). Fixed; a new thunk7 class was added (SysV passes 6 register
+args, Win64 only 4 — SysV register args 4–5 become Win64 *stack* args); and
+the `abi_probe` guest now regression-locks every thunk arity (0–6 + pointer
+args) as a hard CI gate on Windows. `sceKernelExitThread` on Windows was
+also corrected: it now records the result and parks (never unwinding GCC
+frames under MSVC SEH), with `WaitThreadEnd` returning the recorded value
+without joining a parked thread.
+
+### 11.7 Fuzzed guest corpus
+
+`psbet_fuzz` (CI-gated, ASan-clean): deterministic seeded workloads over the
+memory model (alloc/map/verify/unmap/free with invariant checks, allocator
+reuse and coalescing under churn) and over the PBFF executor (byte-level
+mutations of valid streams, fully random streams, valid-random streams that
+must always render). 64 seeds per CI run; exit code = failed seeds.
+
+### 11.8 Risk register update
+
+| Risk | Status after Phase 3 |
+|------|----------------------|
+| Windows guest hosting | ABI root-caused + conformance-gated; park accounting in place |
+| Detached threads at exit | Zero force-detached on POSIX (measured, test-locked) |
+| `longjmp` across guest frames | Structurally eliminated (no cross-thread unwinding exists) |
+| RDNA recompiler vs real captures | Unchanged (Phase 4+, needs captures) |
+| Commercial-title long tail | Unchanged (Phase 6 program) |

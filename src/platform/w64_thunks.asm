@@ -54,6 +54,29 @@ EXTERN psbXGetRuntimeVersion:PROC
 EXTERN psbXGetRuntimeName:PROC
 EXTERN psbXGnmSubmitCommandBuffers:PROC
 EXTERN psbXStackChkFail:PROC
+EXTERN psbXProbeCall1:PROC
+EXTERN psbXProbeCall2:PROC
+EXTERN psbXProbeCall3:PROC
+EXTERN psbXProbeCall4:PROC
+EXTERN psbXProbeCall5:PROC
+EXTERN psbXProbeCall6:PROC
+EXTERN psbXProbePtr2:PROC
+EXTERN psbXSysFreeDirectMemory:PROC
+EXTERN psbXSysMapNamedDirectMemory:PROC
+EXTERN psbXSysMmap:PROC
+EXTERN psbXSysMunmap:PROC
+EXTERN psbXSysQueryMemoryProtection:PROC
+EXTERN psbXSysCreateEqueue:PROC
+EXTERN psbXSysDeleteEqueue:PROC
+EXTERN psbXSysAddEvent:PROC
+EXTERN psbXSysTriggerEvent:PROC
+EXTERN psbXSysWaitEqueue:PROC
+EXTERN psbXSysCancelEvent:PROC
+EXTERN psbXSysLseek:PROC
+EXTERN psbXSysFstat:PROC
+EXTERN psbXGnmReserveGpuAddress:PROC
+EXTERN psbXGnmMapGpuAddress:PROC
+EXTERN psbXGnmUnmapGpuAddress:PROC
 
 _TEXT SEGMENT
 
@@ -91,11 +114,17 @@ name ENDP
 ENDM
 
 ; --- arity 3: rdi->rcx, rsi->rdx, rdx->r8 --------------------------------------
+; Phase-3 FIX (the Phase-2 residual-corruption root cause): r8 must be loaded
+; from rdx BEFORE rdx is clobbered by the rsi move. The previous order
+; (mov rdx, rsi; mov r8, rdx) delivered arg1 twice and LOST arg2 for every
+; 3-argument guest->host call on Windows — sceKernelStartThread got a garbage
+; argp, sceKernelWrite a garbage length, sceKernelCreateCond wrote its handle
+; through a garbage out-pointer (stack scribble -> AV at exit).
 thunk3 MACRO name, target
 name PROC
     mov     rcx, rdi
+    mov     r8,  rdx          ; arg2 read BEFORE rdx is clobbered
     mov     rdx, rsi
-    mov     r8,  rdx
     sub     rsp, 28h
     call    target
     add     rsp, 28h
@@ -156,6 +185,30 @@ name PROC
 name ENDP
 ENDM
 
+; --- arity 7: SysV has 6 register args; Win64 only 4 ---------------------------
+; SysV reg args 4 (R8) and 5 (R9) become Win64 STACK args 5 and 6, and the
+; single SysV stack arg (7th) lands at [rsp+38h]. Scratch registers RAX/R10/
+; R11 are volatile in both ABIs; the originals are captured before the
+; register shuffle clobbers R8/R9.
+thunk7 MACRO name, target
+name PROC
+    mov     rax, [rsp+8]          ; SysV stack arg 7
+    mov     r10, r8               ; SysV arg 5 -> Win64 stack arg 5
+    mov     r11, r9               ; SysV arg 6 -> Win64 stack arg 6
+    mov     r9,  rcx
+    mov     r8,  rdx
+    mov     rdx, rsi
+    mov     rcx, rdi
+    sub     rsp, 38h
+    mov     [rsp+28h], r10
+    mov     [rsp+30h], r11
+    mov     [rsp+38h], rax
+    call    target
+    add     rsp, 38h
+    ret
+name ENDP
+ENDM
+
 ; --- exports -----------------------------------------------------------------
 thunk4 psbTWinAllocateDirectMemory, psbXSysAllocateDirectMemory   ; 6 args
 thunk5 psbTWinMapDirectMemory,      psbXSysMapDirectMemory        ; 5 args
@@ -185,13 +238,40 @@ thunk3 psbTWinWrite,                psbXSysWrite
 thunk3 psbTWinRead,                 psbXSysRead
 thunk3 psbTWinOpen,                 psbXSysOpen
 thunk1 psbTWinClose,                psbXSysClose
+thunk3 psbTWinLseek,                psbXSysLseek
+thunk2 psbTWinFstat,                psbXSysFstat
+thunk2 psbTWinFreeDirectMemory,     psbXSysFreeDirectMemory
+thunk7 psbTWinMapNamedDirectMemory, psbXSysMapNamedDirectMemory  ; 7 args
+thunk6 psbTWinMmap,                 psbXSysMmap
+thunk2 psbTWinMunmap,               psbXSysMunmap
+thunk4 psbTWinQueryMemoryProtection, psbXSysQueryMemoryProtection
+thunk2 psbTWinCreateEqueue,         psbXSysCreateEqueue
+thunk1 psbTWinDeleteEqueue,         psbXSysDeleteEqueue
+thunk4 psbTWinAddEvent,             psbXSysAddEvent
+thunk4 psbTWinTriggerEvent,         psbXSysTriggerEvent
+thunk3 psbTWinWaitEqueue,           psbXSysWaitEqueue
+thunk2 psbTWinCancelEvent,          psbXSysCancelEvent
 thunk0 psbTWinIsNeoMode,            psbXSysIsNeoMode
 thunk1 psbTWinTlsGetAddr,           psbXTlsGetAddr
 thunk1 psbTWinCxaFinalize,          psbXCxaFinalize
 thunk0 psbTWinGetRuntimeVersion,    psbXGetRuntimeVersion
 thunk0 psbTWinGetRuntimeName,       psbXGetRuntimeName
 thunk6 psbTWinGnmSubmit,            psbXGnmSubmitCommandBuffers   ; 6 args
+thunk4 psbTWinGnmReserveGpuVa,      psbXGnmReserveGpuAddress      ; 4 args
+thunk4 psbTWinGnmMapGpuVa,          psbXGnmMapGpuAddress          ; 4 args
+thunk2 psbTWinGnmUnmapGpuVa,        psbXGnmUnmapGpuAddress        ; 2 args
 thunk0 psbTWinStackChkFail,         psbXStackChkFail
+
+; --- Phase-3 ABI conformance probes -------------------------------------------
+; Deterministic argument-position checks exercised by the abi_probe guest so
+; every thunk arity (register args AND stack args) is CI-verified on Windows.
+thunk1 psbTWinProbeCall1,           psbXProbeCall1
+thunk2 psbTWinProbeCall2,           psbXProbeCall2
+thunk3 psbTWinProbeCall3,           psbXProbeCall3
+thunk4 psbTWinProbeCall4,           psbXProbeCall4
+thunk5 psbTWinProbeCall5,           psbXProbeCall5
+thunk6 psbTWinProbeCall6,           psbXProbeCall6
+thunk2 psbTWinProbePtr2,            psbXProbePtr2
 
 _TEXT ENDS
 END

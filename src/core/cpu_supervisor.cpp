@@ -12,11 +12,15 @@
 // ============================================================================
 #include "cpu_supervisor.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <setjmp.h>
+#include <thread>
 
 #include "core/log.h"
 #include "core/kernel_shim.h"
@@ -189,38 +193,57 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
 }
 #else
 // ---------------------------------------------------------------------------
-// POSIX hosting model: same-thread setjmp/longjmp (GCC both sides), with the
-// supervisor frame kept free of C++ objects that own destructors.
+// POSIX hosting model (Phase 3, unified with the Windows shape): the guest
+// main runs on a dedicated thread via kernel::runGuestMainCooperative —
+//   * every thread that executes guest code carries the raw-syscall trap;
+//   * engine threads (this supervisor) stay filter-free, which keeps host
+//     tooling (ASan/LSan stop-the-world) safe;
+//   * guest-initiated exits unwind the GUEST thread's own frames through its
+//     per-thread exit env (no cross-thread longjmp anywhere).
+// The supervisor waits for natural completion, an exit request, or a crash.
 // ---------------------------------------------------------------------------
 GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {
-    // MSVC constraint documented for the Windows path; on GCC, longjmp from
-    // a frame with trivially-destructible locals is well-defined in practice
-    // and ASan-verified leak-free (see PHASE_1_REPORT §5).
-    struct Ctx {
-        jmp_buf                 env;
-    };
-    Ctx ctx{};
-
     GuestRunResult result;
     installCrashDiagnostics(&result.crashReport, mod.base, mod.imageSize);
-    kernel::setProcessJmpBuf(&ctx.env);
 
-    kernel::beginSupervisorScope();
-    kernel::installThreadTls();
+    std::mutex m;
+    std::condition_variable cv;
+    bool guestDone = false;
 
-    if (setjmp(ctx.env) == 0) {
-        using GuestEntry = void (*)();
-        reinterpret_cast<GuestEntry>(mod.entry)();
-        result.exitCode = 0;
+    std::thread guest([&] {
+        const i32 code = kernel::runGuestMainCooperative(
+            reinterpret_cast<void*>(mod.entry), &guestDone);
+        std::lock_guard<std::mutex> lk(m);
+        result.exitCode = code;
         result.exitedViaGuest = true;
-    } else {
-        result.exitCode = kernelState.exitCode();
-        result.exitedViaGuest = true;
-        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result.exitCode);
+        cv.notify_all();
+    });
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] {
+            return guestDone || kernelState.exitRequested()
+                            || !result.crashReport.empty();
+        });
+        // Grace: let the guest main finish unwinding (it always terminates
+        // promptly once done/exitRequested — it unwinds itself via its own
+        // exit env). A compute-bound main that ignores the exit is joined
+        // with a deadline, then detached and accounted (the pre-Phase-3
+        // straggler path, loudly logged).
+        if (!cv.wait_for(lk, std::chrono::milliseconds(200),
+                         [&] { return guestDone; })) {
+            LOG_WARN("CPU: guest main did not terminate within the join "
+                     "grace — detaching (teardown straggler)");
+            guest.detach();
+            kernel::endSupervisorScope();
+            return result;
+        }
     }
-
-    kernel::setProcessJmpBuf(nullptr);
-    kernel::endSupervisorScope();
+    guest.join();
+    if (!kernelState.exitRequested())
+        LOG_INFO("CPU: guest exited naturally (code %d)", result.exitCode);
+    else
+        LOG_INFO("CPU: guest exited via sceKernelExitProcess(%d)", result.exitCode);
     return result;
 }
 #endif

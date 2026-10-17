@@ -1,6 +1,10 @@
 // ============================================================================
 //  PSBET — psbet_main.cpp
-//  CLI front-end: `psbet info <elf>`, `psbet gpu`, `psbet run <elf> [options]`.
+//  CLI front-end:
+//    psbet info <elf>            — parse and print an ELF image
+//    psbet gpu                   — probe the host Vulkan stack
+//    psbet mkfsa <dir> <out>     — pack a directory into a PSBET Archive
+//    psbet run <elf> [options]   — load and execute a guest image
 // ============================================================================
 #include <cstdio>
 #include <cstring>
@@ -10,6 +14,7 @@
 #include "psbet/common.h"
 #include "core/log.h"
 #include "core/elf.h"
+#include "core/pfs.h"
 #include "emulator.h"
 #include "gpu/vulkan_device.h"
 
@@ -17,7 +22,7 @@ namespace {
 
 void printBanner() {
     std::printf(
-        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 2)\n"
+        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 3)\n"
         "Independent original software. No Sony code, keys or firmware.\n\n",
         psb::kVersionMajor, psb::kVersionMinor, psb::kVersionPatch);
 }
@@ -29,6 +34,9 @@ void printUsage() {
         "      Parse and print an ELF image's program headers.\n\n"
         "  psbet gpu\n"
         "      Probe the host Vulkan stack (devices, driver versions).\n\n"
+        "  psbet mkfsa <dir> <out.psa>\n"
+        "      Pack a directory into a read-only PSBET Archive image that\n"
+        "      `run --mount-pfs` mounts at app0:/ (see docs/GUEST_ABI.md §8).\n\n"
         "  psbet run <image.elf> [options]\n"
         "      Load and execute a guest image.\n"
         "Options:\n"
@@ -37,6 +45,9 @@ void printUsage() {
         "  --screenshot-dir DIR        Capture PNG screenshots of the framebuffer\n"
         "  --screenshot-interval N     Capture every N frames (default 30)\n"
         "  --backend NAME              auto | software | vulkan (default auto)\n"
+        "  --mount-pfs IMAGE           Mount a read-only container at app0:/\n"
+        "  --data-dir DIR              Mount a writable host dir at /data\n"
+        "  --syscall-trap MODE         on | off | required (default on)\n"
         "  --verbose                   Debug logging + memory map dump\n");
 }
 
@@ -49,6 +60,18 @@ int main(int argc, char** argv) {
         std::fputs(psb::gpu::VulkanDevice::probeReport().c_str(), stdout);
         std::fputc('\n', stdout);
         return psb::gpu::VulkanDevice::available() ? 0 : 1;
+    }
+
+    if (argc >= 4 && std::strcmp(argv[1], "mkfsa") == 0) {
+        const psb::Result r = psb::pfs::PsbArchive::packDirectory(argv[2], argv[3])
+            ? psb::Result::ok()
+            : psb::Result::fail(psb::Status::IoError, "packing failed (see log)");
+        if (!r) {
+            std::fprintf(stderr, "error: %s\n", r.message.c_str());
+            return 2;
+        }
+        std::printf("packed %s -> %s\n", argv[2], argv[3]);
+        return 0;
     }
 
     if (argc < 3) {
@@ -82,10 +105,16 @@ int main(int argc, char** argv) {
             else if (const char* v = need("--frames")) opt.maxFrames = static_cast<psb::u32>(std::atoi(v));
             else if (const char* v = need("--screenshot-interval"))
                 opt.screenshotInterval = static_cast<psb::u32>(std::atoi(v));
+            else if (const char* v = need("--data-dir"))
+                opt.dataDir = v;
+            else if (const char* v = need("--syscall-trap"))
+                opt.syscallTrap = v;
             else if (std::strcmp(argv[i], "--screenshot-dir") == 0 && i + 1 < argc)
                 opt.screenshotDir = argv[++i];
             else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc)
                 opt.backend = argv[++i];
+            else if (std::strcmp(argv[i], "--mount-pfs") == 0 && i + 1 < argc)
+                opt.mountImage = argv[++i];
             else if (std::strcmp(argv[i], "--verbose") == 0)
                 opt.verbose = true;
             else {
@@ -108,6 +137,10 @@ int main(int argc, char** argv) {
         std::printf("  Average FPS     : %.1f\n", st.avgFps);
         std::printf("  Screenshots     : %u\n", st.screenshots);
         std::printf("  Peak RSS        : %llu KiB\n", static_cast<unsigned long long>(st.peakRssKiB));
+        std::printf("  Guest threads   : %u joined, %u force-detached, %u parked\n",
+                    st.threadsJoined, st.threadsDetached, st.threadsParked);
+        std::printf("  Physical memory : %llu KiB live at exit\n",
+                    static_cast<unsigned long long>(st.memoryUsedBytes / 1024));
         if (st.crashed) std::printf("  CRASH REPORT    : %s", st.crashReport.c_str());
         std::printf("=========================\n");
         return st.guestExitCode;

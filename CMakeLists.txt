@@ -28,10 +28,14 @@ endif()
 add_library(psbet_core STATIC
   src/core/log.cpp
   src/platform/vm.cpp
+  src/core/guest_vm.cpp
   src/core/memory.cpp
   src/core/elf.cpp
   src/core/kernel_shim.cpp
   src/core/cpu_supervisor.cpp
+  src/core/vfs.cpp
+  src/core/pfs.cpp
+  src/core/syscall_trap.cpp
   src/gpu/png.cpp
   src/gpu/spirv_emit.cpp
   src/gpu/shader_cache.cpp
@@ -67,6 +71,10 @@ target_link_libraries(psbet_tests PRIVATE psbet_core)
 
 add_executable(psbet_rdna_tests tests/rdna_tests.cpp)
 target_link_libraries(psbet_rdna_tests PRIVATE psbet_core)
+
+# Fuzzed guest corpus (Phase 3): deterministic kernel-API stress + PBFF fuzz.
+add_executable(psbet_fuzz tests/corpus_fuzz.cpp)
+target_link_libraries(psbet_fuzz PRIVATE psbet_core)
 
 # ---------------------------------------------------------------------------
 # Guest test homebrew (ELF images for the loader to execute).
@@ -107,6 +115,48 @@ if(NOT MSVC AND NOT WIN32)
   set_target_properties(hb_cube PROPERTIES
     OUTPUT_NAME "cube" PREFIX "" SUFFIX ".elf"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  # Phase-3 homebrew suite: ABI conformance probes, VFS/app0, EQUEUE,
+  # raw-syscall containment and GPU-VA draws.
+  add_library(hb_abi_probe SHARED tests/homebrew/abi_probe.c)
+  target_include_directories(hb_abi_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_abi_probe PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_abi_probe PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_abi_probe PROPERTIES
+    OUTPUT_NAME "abi_probe" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_fs_demo SHARED tests/homebrew/fs_demo.c)
+  target_include_directories(hb_fs_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_fs_demo PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_fs_demo PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_fs_demo PROPERTIES
+    OUTPUT_NAME "fs_demo" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_equeue_demo SHARED tests/homebrew/equeue_demo.c)
+  target_include_directories(hb_equeue_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_equeue_demo PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_equeue_demo PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_equeue_demo PROPERTIES
+    OUTPUT_NAME "equeue_demo" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_syscall_probe SHARED tests/homebrew/syscall_probe.c)
+  target_include_directories(hb_syscall_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_syscall_probe PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_syscall_probe PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_syscall_probe PROPERTIES
+    OUTPUT_NAME "syscall_probe" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_cube_vm SHARED tests/homebrew/cube_vm.c)
+  target_include_directories(hb_cube_vm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_cube_vm PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_cube_vm PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_cube_vm PROPERTIES
+    OUTPUT_NAME "cube_vm" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -115,3 +165,4 @@ endif()
 enable_testing()
 add_test(NAME unit_tests COMMAND psbet_tests)
 add_test(NAME rdna_tests COMMAND psbet_rdna_tests)
+add_test(NAME fuzz_corpus COMMAND psbet_fuzz)
