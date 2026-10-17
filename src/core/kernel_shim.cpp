@@ -17,6 +17,7 @@ extern "C" int32_t psbTWinGuestThreadEntry(size_t arglen, void* argp,
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -1007,6 +1008,11 @@ void     psbCxaFinalize(void* d);
 int32_t  psbGetRuntimeVersion(void);
 const char* psbGetRuntimeName(void);
 void     psbStackChkFail(void);
+// Guest libc shim implementations (defined after the extern "C" block).
+size_t   psbShimStrlen(const char* s);
+int32_t  psbShimStrncmp(const char* a, const char* b, size_t n);
+float    psbShimSinf(float x);
+void     psbShimSincosf(float x, float* s, float* c);
 
 extern "C" {
 int32_t  psbXSysAllocateDirectMemory(int64_t a, int64_t b, size_t c, size_t d, int e, int64_t* f)
@@ -1121,8 +1127,48 @@ const char* psbXGetRuntimeName(void)
     { return psbGetRuntimeName(); }
 void     psbXStackChkFail(void)
     { psbStackChkFail(); }
+// Guest libc shim forwarders (see psbShim* below).
+size_t   psbXShimStrlen(const char* a)
+    { return psbShimStrlen(a); }
+int32_t  psbXShimStrncmp(const char* a, const char* b, size_t c)
+    { return psbShimStrncmp(a, b, c); }
+float    psbXShimSinf(float a)
+    { return psbShimSinf(a); }
+void     psbXShimSincosf(float a, float* b, float* c)
+    { psbShimSincosf(a, b, c); }
 } // extern "C"
 #endif // _WIN32
+
+// ---- Guest libc shim -------------------------------------------------------
+// Guests are freestanding GCC images; their small libc surface must resolve
+// against PSBET, not the host process. Linux had an implicit dlsym(RTLD_DEFAULT)
+// fallback (host glibc satisfied strlen/sincosf/...); Windows has no such
+// fallback (static CRT, no GetProcAddress on the exe) — net_probe failed at
+// LOAD with "unresolved import: strlen". Explicit shims make both platforms
+// deterministic. The psbShim* names deliberately do NOT shadow host libc
+// symbols (same interposition reasoning as the runtime section below).
+size_t psbShimStrlen(const char* s) {
+    size_t n = 0;
+    if (s) while (s[n]) ++n;
+    return n;
+}
+int32_t psbShimStrncmp(const char* a, const char* b, size_t n) {
+    if (!a || !b) return a == b ? 0 : (a ? 1 : -1);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char ca = static_cast<unsigned char>(a[i]);
+        const unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (!ca) break;
+    }
+    return 0;
+}
+// Math shims trampoline to the HOST math library (both CRTs provide sinf/
+// cosf); float args/returns ride XMM0 in both ABIs.
+float psbShimSinf(float x) { return std::sin(x); }
+void psbShimSincosf(float x, float* s, float* c) {
+    if (s) *s = std::sin(x);
+    if (c) *c = std::cos(x);
+}
 
 // ---- PSBET runtime --------------------------------------------------------
 // NOTE: implementations are deliberately NOT named __tls_get_addr /
@@ -1216,6 +1262,9 @@ void psbTWinNetAccept(void);             void psbTWinNetSend(void);
 void psbTWinNetRecv(void);               void psbTWinNetCloseSocket(void);
 void psbTWinNetCtlInit(void);            void psbTWinNetCtlTerm(void);
 void psbTWinNetCtlGetState(void);
+// Guest libc shim.
+void psbTWinShimStrlen(void);            void psbTWinShimStrncmp(void);
+void psbTWinShimSinf(void);              void psbTWinShimSincosf(void);
 }
 #define W(name) psbTWin##name
 const Export kExports[] = {
@@ -1299,6 +1348,11 @@ const Export kExports[] = {
     {"sceNetCtlInit",                 (void*)&W(NetCtlInit)},
     {"sceNetCtlTerm",                 (void*)&W(NetCtlTerm)},
     {"sceNetCtlGetState",             (void*)&W(NetCtlGetState)},
+    // Guest libc shim (thunked like every other guest->host import).
+    {"strlen",                        (void*)&W(ShimStrlen)},
+    {"strncmp",                       (void*)&W(ShimStrncmp)},
+    {"sinf",                          (void*)&W(ShimSinf)},
+    {"sincosf",                       (void*)&W(ShimSincosf)},
 };
 #undef W
 #else
@@ -1382,6 +1436,12 @@ const Export kExports[] = {
     {"sceNetCtlInit",                 (void*)&sceNetCtlInit},
     {"sceNetCtlTerm",                 (void*)&sceNetCtlTerm},
     {"sceNetCtlGetState",             (void*)&sceNetCtlGetState},
+    // Guest libc shim — deterministic on both platforms (Linux previously
+    // leaned on the dlsym(RTLD_DEFAULT) host-libc fallback).
+    {"strlen",                        (void*)&psbShimStrlen},
+    {"strncmp",                       (void*)&psbShimStrncmp},
+    {"sinf",                          (void*)&psbShimSinf},
+    {"sincosf",                       (void*)&psbShimSincosf},
 };
 #endif // _WIN32
 

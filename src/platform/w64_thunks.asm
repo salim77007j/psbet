@@ -101,6 +101,11 @@ EXTERN psbXNetCloseSocket:PROC
 EXTERN psbXNetCtlInit:PROC
 EXTERN psbXNetCtlTerm:PROC
 EXTERN psbXNetCtlGetState:PROC
+; --- guest libc shim (PSBET provides these; no host dlsym on Windows) --------
+EXTERN psbXShimStrlen:PROC
+EXTERN psbXShimStrncmp:PROC
+EXTERN psbXShimSinf:PROC
+EXTERN psbXShimSincosf:PROC
 
 _TEXT SEGMENT
 
@@ -340,6 +345,16 @@ thunk4 psbTWinProbeCall4,           psbXProbeCall4
 thunk5 psbTWinProbeCall5,           psbXProbeCall5
 thunk6 psbTWinProbeCall6,           psbXProbeCall6
 thunk2 psbTWinProbePtr2,            psbXProbePtr2
+
+; --- guest libc shim ---------------------------------------------------------
+; strlen/strncmp: 1/3 GP args — plain register shuffles.
+; sinf: the float arg rides XMM0 in BOTH ABIs (thunk1's GP shuffle is inert).
+; sincosf(float x, float* s, float* c): x is the FIRST argument in both ABIs
+; (XMM0), pointers shift RDI->RCX, RSI->RDX — exactly thunk3's GP shuffle.
+thunk1 psbTWinShimStrlen,   psbXShimStrlen
+thunk3 psbTWinShimStrncmp,  psbXShimStrncmp
+thunk1 psbTWinShimSinf,     psbXShimSinf
+thunk3 psbTWinShimSincosf,  psbXShimSincosf
 
 ; ---------------------------------------------------------------------------
 ; Host -> guest ABI bridge (the reverse direction of the thunks above).
