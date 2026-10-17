@@ -7,6 +7,13 @@
 // ============================================================================
 #include "kernel_shim.h"
 
+#if defined(_WIN32)
+// Host->guest ABI bridge (w64_thunks.asm): MSVC host code launching a guest
+// worker — declared early; sceKernelStartThread uses it below.
+extern "C" int32_t psbTWinGuestThreadEntry(size_t arglen, void* argp,
+                                           void* entry);
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -991,10 +998,9 @@ int32_t psbProbePtr2(void* out, uint64_t val) {
 // Guests call these through SysV->Win64 thunks (w64_thunks.asm): the thunk
 // shuffles SysV registers (RDI,RSI,RDX,RCX...) into Win64 order (RCX,RDX,R8,
 // R9) and reserves shadow space. Forwarders only — all logic stays here.
-// psbTWinGuestThreadEntry is the REVERSE bridge: host->guest worker launch.
+// (psbTWinGuestThreadEntry — the REVERSE bridge, host->guest worker launch —
+// is declared at the top of this file: sceKernelStartThread uses it.)
 #if defined(_WIN32)
-extern "C" int32_t psbTWinGuestThreadEntry(size_t arglen, void* argp,
-                                           void* entry);
 // Defined later in this file (PSBET runtime section).
 void*    psbTlsGetAddr(PsbTlsIndex* idx);
 void     psbCxaFinalize(void* d);
