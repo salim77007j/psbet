@@ -223,8 +223,14 @@ jobs:
         timeout-minutes: 5
         run: |
           Release\psbet.exe run ..\guests\worker_exit.elf
-          echo "exit: $LASTEXITCODE"
-          if ($LASTEXITCODE -ne 7) { exit $LASTEXITCODE }
+          $code = $LASTEXITCODE
+          echo "exit: $code"
+          # worker_exit's CONTRACT is exit code 7 (worker-initiated exit).
+          # Explicit `exit 0` on success: the GHA pwsh wrapper appends
+          # `exit $LASTEXITCODE` to every step, which would otherwise fail
+          # the step on the guest's correct nonzero code.
+          if ($code -ne 7) { exit $code }
+          exit 0
 
       # Phase 4: the Windows thunk surface now covers audio/pad/net/counter
       # (arities 0-6). net_probe + audio_tone (null audio backend) + input_demo
