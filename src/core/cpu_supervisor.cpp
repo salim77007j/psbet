@@ -140,6 +140,16 @@ void installCrashDiagnostics(std::string* reportSink, u64 moduleBase, u64 module
 // unwinding guest frames) and is detached at shutdown — the process is
 // exiting anyway. Crash diagnostics come from the VEH handler above.
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
+// Host->guest ABI bridge (w64_thunks.asm): Win64 host code cannot call
+// GCC-compiled guest code directly — SysV volatile RDI/RSI are Win64
+// nonvolatile, and argument registers differ. Used for the guest main entry
+// (void, no args — the shuffled arguments are ignored) and for worker
+// launches in kernel_shim.cpp.
+extern "C" int32_t psbTWinGuestThreadEntry(size_t arglen, void* argp,
+                                           void* entry);
+#endif
+
 GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kernelState) {
     GuestRunResult result;
     installCrashDiagnostics(&result.crashReport, mod.base, mod.imageSize);
@@ -155,8 +165,15 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
         LOG_INFO("CPU: guest thread entered trampoline", "");
         kernel::installThreadTls();
         LOG_INFO("CPU: guest thread TLS installed", "");
+#if defined(_WIN32)
+        // Route through the ABI bridge: a direct MSVC->GCC call would leave
+        // the guest's clobbered RDI/RSI (SysV-volatile) visible to MSVC code
+        // (Win64-nonvolatile). Guest main is void() — args ignored.
+        psbTWinGuestThreadEntry(0, nullptr, mod.entry);
+#else
         using GuestEntry = void (*)();
         reinterpret_cast<GuestEntry>(mod.entry)();
+#endif
         LOG_INFO("CPU: guest entry returned naturally", "");
         // Guest returned without ExitProcess: natural completion.
         std::lock_guard<std::mutex> lk(m);

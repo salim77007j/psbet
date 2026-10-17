@@ -349,13 +349,23 @@ thunk2 psbTWinProbePtr2,            psbXProbePtr2
 ; garbage arguments (the hello.exe ACCESS_VIOLATION: its worker dereferenced
 ; the garbage argp). The bridge shuffles and calls; the guest's int32 return
 ; arrives in EAX, which is the return register in both ABIs.
+;
+; REGISTER CONTRACT: RDI/RSI are NONVOLATILE in Win64 but VOLATILE in SysV —
+; the guest will clobber them without saving. The bridge must preserve them
+; across the call (learned the hard way: the first version didn't, and both
+; hello workers crashed at the same host PC on return into MSVC code).
+; Alignment: entry RSP%16=8, two pushes -> 8, sub 28h -> 48 ≡ 0 at the call.
 ; ---------------------------------------------------------------------------
 psbTWinGuestThreadEntry PROC
+    push    rdi                   ; Win64 nonvolatile — preserve
+    push    rsi
     mov     rdi, rcx              ; SysV arg1 = arglen
     mov     rsi, rdx              ; SysV arg2 = argp
-    sub     rsp, 28h              ; shadow + 16-alignment (entry RSP%16 = 8)
+    sub     rsp, 28h              ; shadow + 16-alignment at the call
     call    r8                    ; guest entry (runtime pointer)
     add     rsp, 28h
+    pop     rsi
+    pop     rdi
     ret
 psbTWinGuestThreadEntry ENDP
 
