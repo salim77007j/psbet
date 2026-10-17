@@ -86,7 +86,7 @@ jobs:
         run: |
           ./psbet run audio_tone.elf --fps 60 --audio-dump tone.wav
           ls -la tone.wav
-          printf '100 1 128 128 128 128 0 0\n150 0 128 128 128 128 0 0\n200 GYRO 0.10 0.20 -0.98 12 0 -6\n300 100 128 128 128 128 0 255\n' > pad.txt
+          printf '# 5 presses: median-based runner-structural latency verdict\n100 1 128 128 128 128 0 0\n150 0 128 128 128 128 0 0\n200 GYRO 0.10 0.20 -0.98 12 0 -6\n250 1 128 128 128 128 0 0\n300 0 128 128 128 128 0 0\n350 GYRO 0.10 0.20 -0.98 12 0 -6\n400 1 128 128 128 128 0 0\n450 0 128 128 128 128 0 0\n500 GYRO 0.10 0.20 -0.98 12 0 -6\n550 1 128 128 128 128 0 0\n600 0 128 128 128 128 0 0\n650 GYRO 0.10 0.20 -0.98 12 0 -6\n700 1 128 128 128 128 0 0\n750 0 128 128 128 128 0 0\n900 100 128 128 128 128 0 255\n' > pad.txt
           ./psbet run input_demo.elf --fps 60 --pad-script pad.txt
           ./psbet run net_probe.elf
 

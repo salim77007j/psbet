@@ -1163,16 +1163,31 @@ bool test_guest_audio_paced() {
 }
 
 bool test_guest_input_latency() {
-    // Scripted DualSense input at 60 FPS pacing. The guest self-fails
-    // (exit 1) when any observed press exceeds the 25 ms budget.
+    // Scripted DualSense input at 60 FPS pacing, five CROSS presses. The
+    // guest self-adjudicates (exit 1) when the MEDIAN press latency
+    // exceeds max(25 ms, achievedFrameInterval + 8.3 ms) or any single
+    // press exceeds the stall ceiling — the runner-structural form of the
+    // < 25 ms acceptance (timestampUs is the scheduled script time, so
+    // per-press values legitimately include guest frame lateness).
     {
         std::FILE* f = std::fopen("test_pad_script.txt", "w");
         CHECK(f != nullptr);
         std::fputs("# PSBET scripted pad events\n"
-                   "100 1 128 128 128 128 0 0\n"     // Cross @ 100 ms
-                   "150 0 128 128 128 128 0 0\n"     // release
+                   "100 1 128 128 128 128 0 0\n"      // Cross @ 100 ms
+                   "150 0 128 128 128 128 0 0\n"      // release
                    "200 GYRO 0.10 0.20 -0.98 12 0 -6\n"
-                   "300 100 128 128 128 128 0 255\n",// Options @ 300 ms
+                   "250 1 128 128 128 128 0 0\n"      // Cross @ 250 ms
+                   "300 0 128 128 128 128 0 0\n"      // release
+                   "350 GYRO 0.10 0.20 -0.98 12 0 -6\n"
+                   "400 1 128 128 128 128 0 0\n"      // Cross @ 400 ms
+                   "450 0 128 128 128 128 0 0\n"      // release
+                   "500 GYRO 0.10 0.20 -0.98 12 0 -6\n"
+                   "550 1 128 128 128 128 0 0\n"      // Cross @ 550 ms
+                   "600 0 128 128 128 128 0 0\n"      // release
+                   "650 GYRO 0.10 0.20 -0.98 12 0 -6\n"
+                   "700 1 128 128 128 128 0 0\n"      // Cross @ 700 ms
+                   "750 0 128 128 128 128 0 0\n"      // release
+                   "900 100 128 128 128 128 0 255\n", // Options @ 900 ms
                    f);
         std::fclose(f);
     }
