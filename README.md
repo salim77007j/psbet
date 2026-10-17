@@ -4,15 +4,16 @@
 software (x86-64 guest images with Orbis-style system interfaces) on standard
 PCs running Linux and Windows.
 
-> **Status: Phase 3 complete** — everything from Phases 1–2 plus: the faithful
-> memory model (typed direct-memory pools, two-level guest page tables, a
-> separate **GPU virtual address space**), a virtualized filesystem
-> (`app0:/` container mounts + writable `/data`), event queues (EQUEUE), a
-> raw-syscall containment layer (seccomp-based), ELF loader v2 for
-> real-image layouts (ET_EXEC, non-zero bases, IRELATIVE, RELRO), zero-
-> detached-thread teardown (measured), and the Windows SysV→Win64 ABI
-> conformance suite (the Phase-2 residual corruption root-caused and
-> regression-locked). See `docs/PHASE_3_REPORT.md`.
+> **Status: Phase 4 complete** — everything from Phases 1–3 plus: the
+> guest timing domain (monotonic + drift-free by construction, 24 h
+> simulated soak), **AudioOut** (guest-side mixing into a fixed 48 kHz
+> stereo master, WAV-dump + SDL3 backends, zero-drop invariant), **pad
+> input** (DualSense-style state + gyroscope; deterministic scripted
+> driver and SDL3 gamepads; measured < 25 ms end-to-end latency at 60 FPS
+> pacing), **target-FPS authorization** with frame-clock audio
+> consumption, a vsync present-queue model, the presentation layer
+> (offscreen or SDL3 window), and logged, fully-stubbed network. See
+> `docs/PHASE_4_REPORT.md`.
 
 ![Cube demo](docs/screenshots/cube_soak_frame_5400.png)
 
@@ -38,8 +39,13 @@ behavior is reimplemented, cleanly, from public documentation:
 | GPU (RDNA 2)  | Command-buffer executor → software rasterizer (reference)        | ✅ Working           |
 | GPU (RDNA 2)  | Vulkan backend (offscreen, loader-based)                         | ✅ Working           |
 | GPU (RDNA 2)  | RDNA→SPIR-V shader recompiler (documented subset, validated)     | ✅ Working           |
-| Filesystem    | PFS/PKG layer                                                    | 🔜 Phase 3           |
-| Audio / Input | SDL-based                                                        | 🔜 Phase 4           |
+| Filesystem    | PSA container mounts (`app0:/`) + `/data` passthrough (v1.2)     | ✅ Working           |
+| Audio out     | Guest-side mixing, 48 kHz stereo master; WAV-dump / SDL3 / null  | ✅ Working (Phase 4) |
+| Input         | DualSense-style pad + gyro; scripted + SDL3 drivers              | ✅ Working (Phase 4) |
+| Timing        | Monotonic drift-free domain, counter API, paced frame clock      | ✅ Working (Phase 4) |
+| Presentation  | Offscreen (CI) or SDL3 window                                    | ✅ Working (Phase 4) |
+| Network       | Stubbed with logging — no connectivity, by design                | ✅ Working (Phase 4) |
+| Performance   | Pipelining, 4K/120 target, perf CI gate                          | 🔜 Phase 5           |
 
 ## GPU backends
 

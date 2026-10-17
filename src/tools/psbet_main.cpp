@@ -7,6 +7,7 @@
 //    psbet run <elf> [options]   — load and execute a guest image
 // ============================================================================
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -22,7 +23,7 @@ namespace {
 
 void printBanner() {
     std::printf(
-        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 3)\n"
+        "PSBET %u.%u.%u — clean-room PS5 runtime for PC (Phase 4)\n"
         "Independent original software. No Sony code, keys or firmware.\n\n",
         psb::kVersionMajor, psb::kVersionMinor, psb::kVersionPatch);
 }
@@ -48,6 +49,13 @@ void printUsage() {
         "  --mount-pfs IMAGE           Mount a read-only container at app0:/\n"
         "  --data-dir DIR              Mount a writable host dir at /data\n"
         "  --syscall-trap MODE         on | off | required (default on)\n"
+        "  --fps N                     Authorize a target frame rate (60/120);\n"
+        "                              0 = free run (default). Enables paced\n"
+        "                              audio consumption (audio-video sync).\n"
+        "  --vsync on|off              Present-queue backpressure (with --fps)\n"
+        "  --audio-dump PATH           Dump the mixed master stream as WAV\n"
+        "  --pad-script PATH           Scripted pad events (deterministic input)\n"
+        "  --window on|off             SDL3 presentation window (if built in)\n"
         "  --verbose                   Debug logging + memory map dump\n");
 }
 
@@ -109,6 +117,16 @@ int main(int argc, char** argv) {
                 opt.dataDir = v;
             else if (const char* v = need("--syscall-trap"))
                 opt.syscallTrap = v;
+            else if (const char* v = need("--fps"))
+                opt.targetFps = static_cast<psb::u64>(std::atoll(v));
+            else if (const char* v = need("--audio-dump"))
+                opt.audioDump = v;
+            else if (const char* v = need("--pad-script"))
+                opt.padScript = v;
+            else if (std::strcmp(argv[i], "--vsync") == 0 && i + 1 < argc)
+                opt.vsync = (std::strcmp(argv[++i], "on") == 0);
+            else if (std::strcmp(argv[i], "--window") == 0 && i + 1 < argc)
+                opt.window = argv[++i];
             else if (std::strcmp(argv[i], "--screenshot-dir") == 0 && i + 1 < argc)
                 opt.screenshotDir = argv[++i];
             else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc)
@@ -130,11 +148,23 @@ int main(int argc, char** argv) {
 
         std::printf("\n=== PSBET run summary ===\n");
         std::printf("  GPU backend     : %s\n", st.backendUsed.c_str());
+        std::printf("  Presenter       : %s\n", st.presenterUsed.c_str());
         std::printf("  Guest exit code : %d%s\n", st.guestExitCode,
                     st.guestExitCode == 124 ? " (frame limit)" : "");
         std::printf("  Frames rendered : %llu\n", static_cast<unsigned long long>(st.frames));
         std::printf("  Wall time       : %llu ms\n", static_cast<unsigned long long>(st.elapsedMs));
         std::printf("  Average FPS     : %.1f\n", st.avgFps);
+        std::printf("  Frame interval  : mean %.2f ms, max %.2f ms, vsync waits %u\n",
+                    st.frameMeanIntervalMs, st.frameMaxIntervalMs, st.vsyncWaits);
+        std::printf("  Audio backend   : %s (submitted %llu, mixed %llu, dropped %llu,\n"
+                    "                    max latency %u ms, backpressure waits %u)\n",
+                    st.audioBackendUsed.c_str(),
+                    static_cast<unsigned long long>(st.audioSubmittedFrames),
+                    static_cast<unsigned long long>(st.audioMixedFrames),
+                    static_cast<unsigned long long>(st.audioDroppedFrames),
+                    st.audioMaxLatencyMs, st.audioBackpressureWaits);
+        std::printf("  Net stubs       : %llu calls refused (no network)\n",
+                    static_cast<unsigned long long>(st.netStubCalls));
         std::printf("  Screenshots     : %u\n", st.screenshots);
         std::printf("  Peak RSS        : %llu KiB\n", static_cast<unsigned long long>(st.peakRssKiB));
         std::printf("  Guest threads   : %u joined, %u force-detached, %u parked\n",

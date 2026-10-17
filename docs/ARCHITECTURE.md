@@ -401,3 +401,96 @@ must always render). 64 seeds per CI run; exit code = failed seeds.
 | `longjmp` across guest frames | Structurally eliminated (no cross-thread unwinding exists) |
 | RDNA recompiler vs real captures | Unchanged (Phase 4+, needs captures) |
 | Commercial-title long tail | Unchanged (Phase 6 program) |
+
+## 12. Phase 4 addendum — audio, input, timing, pacing, presentation
+
+### 12.1 Time domain (the single guest clock)
+
+Every guest timing API derives from one `TimeDomain`: `value = origin +
+(now − start)` on the host steady clock, or an injected virtual offset in
+test mode. There is no accumulation and no re-derivation against a second
+clock, so the two classic drift sources of emulated clocks cannot occur.
+The counter API (`GetProcessTimeCounter` + fixed 1 GHz frequency) serves
+the same domain. Sleeps are cooperative: they slice at 2 ms and wake early
+on exit/shutdown — a sleeping guest can no longer stall teardown (the last
+blocking primitive that could).
+
+The 24-hour simulated soak runs the domain in virtual mode: 86,400 seconds
+are injected in 100 ms steps with exact-value assertions (drift-free by
+construction is verified, not assumed), plus concurrent readers asserting
+monotonicity.
+
+### 12.2 AudioOut: shared master timeline with per-port cursors
+
+The mixer owns ONE master ring (65,536 frames ≈ 1.36 s, interleaved stereo
+i32 accumulators). Each port has a write cursor that advances only with its
+own submits; ports submitting in the same frame window therefore SUM into
+the same master frames (Orbis-style parallel mixing), while staggered
+submits lay out sequentially. Volume (per port per channel, 0..32768) and
+format conversion (s16 mono/stereo, f32 stereo) apply at write time; a
+single clamp happens at read time.
+
+Consumption models:
+* **soak** (no pacing) — every submit drains the written region immediately
+  (conservatively: never past the minimum live port cursor, so a second
+  port's same-window submit is never misclassified as late);
+* **paced** (`--fps N`) — each presented frame authorizes exactly
+  (48000/N) master frames; audio is glued to video pacing;
+* **SDL3** (optional build) — the same rules; SDL consumes by wall clock on
+  a real/dummy device.
+
+Backpressure: a submit blocks (guest-cooperative 1 ms slices) while the
+unplayed frontier is at/over the 30 ms cap, with a 50 ms liveness bound —
+under the frame-clock model the presenter is often the same guest thread,
+so a submit that cannot be resolved by the drain must not wait forever.
+The read position never advances past the written frontier (an over-advance
+would underflow every unsigned room-check into "forever full" — found by
+the paced tone run, documented here as the reason the advance is clamped
+and underruns are counted instead).
+
+Dropped samples are an invariant: 0. The only drop path is a port
+submitting into an already-played region (genuinely late), which is
+counted in stats, never silent. The fuzz corpus (Phase F) exercises random
+port open/output/volume/close sequences and asserts the invariant per run.
+
+### 12.3 Pad: driver-model input with a latency contract
+
+`PadService` serves Orbis-shaped `scePad*` reads from a pluggable driver:
+`NullPadDriver` (all disconnected), `ScriptedPadDriver` (deterministic
+time-keyed events from a text script — CI and reproducible bug reports),
+and `SdlGamepadDriver` (SDL3 game controllers + gyro; real DualSense
+mapping). Every state carries `timestampUs` (when it became valid), so
+end-to-end input latency = observation − timestamp is measurable inside the
+guest. At 60 FPS pacing the input_demo guest measures and enforces the
+< 25 ms budget itself; the CI suite asserts it end-to-end.
+
+### 12.4 Pacing, vsync, presentation
+
+`FramePacer` implements target-FPS authorization (the console boost-mode
+analogue: `--fps 60|120`) on an ABSOLUTE schedule (frame N presents at
+start + N·period) — pacing error cannot accumulate. Vsync is modelled as
+present-queue backpressure (depth 2) with honest scoping: under Phase 4's
+synchronous submit path it degenerates to pacing and its wait counter
+reads 0; it becomes measurable when command recording pipelines (Phase 5).
+Presentation goes through an `IPresenter`: offscreen (default, CI) or the
+SDL3 window + streaming texture (works under the CI dummy video driver,
+real display on user machines). Frame-interval statistics (mean/min/max/
+p99) are reported in every run summary.
+
+### 12.5 Net stubs
+
+The `sceNet*` surface is fully stubbed: every call is rate-limited-logged
+(first 8 in full, then aggregated) and refused with documented codes;
+`sceNetCtlGetState` honestly reports disconnected. Nothing opens sockets
+or touches the host stack — auditable by construction. Counters are
+exposed to the run summary.
+
+### 12.6 Risk register update
+
+| Risk | Status after Phase 4 |
+|------|----------------------|
+| Audio fidelity vs real devices | SDL3 path verified via dummy driver + WAV-dump evidence; real-speaker validation is user-side |
+| Pacing under pipelined submits | Vsync queue depth ready; measurement lands with Phase 5 recording |
+| RDNA recompiler vs real captures | Unchanged (Phase 4+ per RDNA_SUBSET.md) |
+| Net-dependent guests | Deterministic refusal + logging; guests can gate on link state |
+| Commercial-title long tail | Unchanged (Phase 6 program) |

@@ -20,6 +20,12 @@ struct EmuOptions {
     std::string mountImage;          // read-only app0:/ container (Phase 3)
     std::string dataDir;             // writable /data host dir (Phase 3)
     std::string syscallTrap = "on";  // on | off | required (Phase 3)
+    // Phase 4 — audio, input, timing:
+    u64         targetFps = 0;       // 0 = free run; 60/120 = authorized pacing
+    bool        vsync = false;       // present-queue backpressure (with fps)
+    std::string audioDump;           // WAV path -> mixed-master dump backend
+    std::string padScript;           // scripted pad events (time-keyed)
+    std::string window = "off";      // on -> SDL3 presentation window (opt.)
 };
 
 struct EmuStats {
@@ -38,6 +44,18 @@ struct EmuStats {
     u32    threadsDetached = 0;      // force-detached stragglers (0 = clean)
     u32    threadsParked = 0;        // Windows recorded-exit parks
     u64    memoryUsedBytes = 0;      // physical bytes live at exit
+    // Phase-4 audio/input/timing accounting:
+    std::string audioBackendUsed;    // wav-dump | sdl3 | null | none
+    u64    audioSubmittedFrames = 0; // master frames submitted by the guest
+    u64    audioMixedFrames = 0;     // master frames consumed by the backend
+    u64    audioDroppedFrames = 0;   // INVARIANT: 0
+    u32    audioMaxLatencyMs = 0;    // max queue depth observed at submit
+    u32    audioBackpressureWaits = 0;
+    double frameMeanIntervalMs = 0.0;
+    double frameMaxIntervalMs = 0.0;
+    u32    vsyncWaits = 0;
+    u64    netStubCalls = 0;
+    std::string presenterUsed;       // offscreen | sdl3-window
 };
 
 class Emulator {

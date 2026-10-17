@@ -76,16 +76,31 @@ deterministic fuzz corpus.
 - [x] Windows: thunk3 arg-loss fixed (the Phase-2 residual root cause);
       abi_probe + hello + worker_exit are hard CI gates
 
-## Phase 4 — Audio, input, timing
+## Phase 4 — Audio, input, timing ✅
 
-Scope: SDL3 audio backend with guest-side mixing semantics; DualSense input
-mapping (SDL game controller + gyroscope); vsync/pacing model (target FPS
-authorization like console boost modes); net stubs with logging.
+Scope delivered: guest time domain (monotonic + drift-free by construction,
+counter API, exit-aware cooperative sleeps, 24 h simulated soak), AudioOut
+device model (shared master timeline, per-port cursors, guest-side mixing,
+48 kHz stereo, WAV-dump + SDL3 backends), pad service with scripted
+deterministic driver + SDL3 gamepad driver (DualSense mapping, gyro),
+target-FPS authorization with frame-clock audio consumption, vsync
+present-queue model, presentation layer (offscreen + SDL3 window), net
+stubs with logging, `sceKernelGetProcessTimeCounter[Frequency]`,
+`sceAudioOut*`, `scePad*`, `sceNet*` surfaces + Windows thunks.
 
-**Acceptance targets:**
-- Audio: glitch-free 48 kHz stereo under load; measured latency < 40 ms
-- Input: end-to-end latency < 25 ms at 60 FPS pacing
-- Guest timing APIs monotonic and drift-free over 24 h simulated soak
+**Acceptance:**
+- [x] Audio: glitch-free 48 kHz stereo under load — zero drops is an
+      invariant, fuzz-locked (Phase F) and measured on the paced tone run
+      (24,000 frames mixed, 0 dropped, max queue latency 16 ms < 40 ms)
+- [x] Input: end-to-end latency < 25 ms at 60 FPS pacing — measured inside
+      the guest (17.9 ms observed) and asserted end-to-end by the suite
+- [x] Guest timing APIs monotonic and drift-free over 24 h simulated soak —
+      exact-value assertions every 100 ms of guest time, concurrent-reader
+      monotonicity under threads
+- [x] SDL3 integration optional and verified: window presenter + audio +
+      gamepad backends build from source and run under the CI dummy drivers
+- [x] Net stubs: every call refused with documented codes, logged, zero
+      host connectivity (net_probe guest hard gate on both platforms)
 
 ## Phase 5 — Performance engineering
 

@@ -14,13 +14,20 @@
 #include <cstring>
 #include <string>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 #include "psbet/common.h"
+#include "psbet/psb_guest_api.h"
 #include "core/memory.h"
 #include "core/elf.h"
 #include "core/log.h"
 #include "core/pfs.h"
+#include "core/timing.h"
+#include "core/audio.h"
+#include "core/pad.h"
+#include "core/net_stubs.h"
+#include "core/pacer.h"
 #include "gpu/png.h"
 #include "gpu/rasterizer.h"
 #include "gpu/gpu_shim.h"
@@ -691,8 +698,286 @@ bool test_guest_cube() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-3 end-to-end guest suite.
+// Phase-4 unit tests: timing, audio, pad, net.
 // ---------------------------------------------------------------------------
+bool test_timing_domain() {
+    using psb::time::TimeDomain;
+    TimeDomain& td = TimeDomain::get();
+
+    // Wall-clock mode: monotonic, sane.
+    td.init();
+    psb::u64 prev = td.us();
+    for (int i = 0; i < 1000; ++i) {
+        const psb::u64 v = td.us();
+        CHECK(v >= prev);
+        prev = v;
+    }
+    CHECK(td.ns() >= prev * 1000ull - 1000ull);   // ns derived consistently
+    CHECK(TimeDomain::kCounterFrequency == 1000000000ull);
+
+    // 24 h SIMULATED SOAK: virtual mode, 1 s steps + fine interleaves.
+    // Drift-free by construction: the value IS the injected offset, so every
+    // step must match the expected value EXACTLY.
+    td.enableVirtual(0);
+    const psb::u64 kSecond = 1'000'000ull;
+    const psb::u64 kDay = 24ull * 3600ull * kSecond;
+    psb::u64 expected = 0;
+    psb::u64 lastSeen = 0;
+    for (psb::u64 s = 0; s < kDay / kSecond; ++s) {
+        // Fine interleaves: 10 x 100 ms inside every simulated second.
+        for (int f = 0; f < 10; ++f) {
+            td.advanceVirtual(100'000ull);
+            expected += 100'000ull;
+            const psb::u64 v = td.us();
+            CHECK(v == expected);          // exact — zero drift
+            CHECK(v >= lastSeen);          // monotonic
+            lastSeen = v;
+        }
+    }
+    CHECK(lastSeen == kDay);               // exactly 24 h of guest time
+
+    // Concurrent readers must never observe a decrease (2 readers, 5k each).
+    td.enableVirtual(0);
+    auto reader = [&td](psb::u64* bad) {
+        psb::u64 prev = 0;
+        for (int i = 0; i < 5000; ++i) {
+            const psb::u64 v = td.us();
+            if (v < prev) { (*bad)++; }
+            prev = v;
+        }
+    };
+    psb::u64 badA = 0, badB = 0;
+    std::thread ra([&] { reader(&badA); });
+    std::thread rb([&] { reader(&badB); });
+    for (int i = 0; i < 5000; ++i) td.advanceVirtual(137ull);
+    ra.join();
+    rb.join();
+    CHECK(badA == 0);
+    CHECK(badB == 0);
+
+    td.disableVirtual();
+    td.init();
+    return true;
+}
+
+bool test_audio_unit() {
+    using namespace psb;
+    using namespace psb::audio;
+    Mixer& mx = Mixer::get();
+
+    // Deterministic WAV-dump backend (soak path: submits drain immediately).
+    auto backend = std::make_unique<WavDumpBackend>("");   // no file write
+    WavDumpBackend* dump = backend.get();
+    mx.setBackend(std::move(backend));
+
+    const i32 main_ = sceAudioOutOpen(0, PSB_AUDIO_PORT_MAIN, 0, 100, 48000,
+                                      PSB_AUDIO_FMT_S16_STEREO);
+    CHECK(main_ == 1);
+    i32 volMax[2] = {kVolMax, kVolMax};
+    CHECK(sceAudioOutSetVolume(main_, PSB_AUDIO_CH_LEFT | PSB_AUDIO_CH_RIGHT,
+                               volMax) == 0);
+
+    // Tone A: recognizable asymmetric pattern.
+    i16 bufA[200];
+    for (int i = 0; i < 100; ++i) {
+        bufA[2 * i] = static_cast<i16>((i % 7) * 1000 - 3000);
+        bufA[2 * i + 1] = static_cast<i16>(5000 - (i % 11) * 800);
+    }
+    CHECK(sceAudioOutOutput(main_, bufA) == 0);
+
+    // Volume clamp + per-channel independence.
+    i32 volOver[2] = {999999, -5};
+    CHECK(sceAudioOutSetVolume(main_, PSB_AUDIO_CH_LEFT | PSB_AUDIO_CH_RIGHT,
+                               volOver) == 0);
+    CHECK(sceAudioOutOutput(main_, bufA) == 0);
+    // Restore full volume for the mixing section below.
+    CHECK(sceAudioOutSetVolume(main_, PSB_AUDIO_CH_LEFT | PSB_AUDIO_CH_RIGHT,
+                               volMax) == 0);
+
+    // Two-port mix: BGM at half volume — master = A + (B*16384)/32768.
+    const i32 bgm = sceAudioOutOpen(0, PSB_AUDIO_PORT_BGM, 0, 100, 48000,
+                                    PSB_AUDIO_FMT_S16_STEREO);
+    CHECK(bgm == 2);
+    i32 volHalf[2] = {kVolMax / 2, kVolMax / 2};
+    CHECK(sceAudioOutSetVolume(bgm, PSB_AUDIO_CH_LEFT | PSB_AUDIO_CH_RIGHT,
+                               volHalf) == 0);
+    i16 bufB[200];
+    for (int i = 0; i < 100; ++i) {
+        bufB[2 * i] = static_cast<i16>((i % 5) * 2000 - 4000);
+        bufB[2 * i + 1] = static_cast<i16>(3000 - (i % 3) * 1500);
+    }
+    CHECK(sceAudioOutOutput(main_, bufA) == 0);
+    CHECK(sceAudioOutOutput(bgm, bufB) == 0);
+
+    // Documented error paths.
+    CHECK(sceAudioOutOpen(0, 9, 0, 100, 48000, PSB_AUDIO_FMT_S16_STEREO) == -1);
+    CHECK(sceAudioOutOpen(0, PSB_AUDIO_PORT_MAIN, 1, 100, 48000,
+                          PSB_AUDIO_FMT_S16_STEREO) == -1);
+    CHECK(sceAudioOutOpen(0, PSB_AUDIO_PORT_MAIN, 0, 100, 44100,
+                          PSB_AUDIO_FMT_S16_STEREO) == -1);
+    CHECK(sceAudioOutOpen(0, PSB_AUDIO_PORT_MAIN, 0, 0, 48000,
+                          PSB_AUDIO_FMT_S16_STEREO) == -1);
+    CHECK(sceAudioOutOutput(42, bufA) == -1);
+    CHECK(sceAudioOutClose(42) == -1);
+    CHECK(sceAudioOutClose(bgm) == 0);
+    CHECK(sceAudioOutClose(main_) == 0);
+
+    // Verify the mixed master stream sample-by-sample (same integer math
+    // the mixer uses). Geometry under the cursor model: submits 1 and 2 play
+    // solo; submit 3 (main) and submit 4 (bgm) land in the SAME window and
+    // SUM — the essence of guest-side parallel mixing.
+    // NOTE: read the dump BEFORE clearBackend() — it owns/destroys the
+    // backend instance.
+    const std::vector<i16>& s = dump->samples();
+    CHECK(s.size() == 600);   // 100 + 100 + 100(mixed) frames x 2 channels
+    auto clamp16 = [](i32 v) -> i16 {
+        return static_cast<i16>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+    };
+    const size_t off1 = 0, off2 = 200, off3 = 400;   // samples: 100 frames = 200
+    bool allMixOk = true;
+    for (int i = 0; i < 100 && allMixOk; ++i) {
+        const i16 al = bufA[2*i], ar = bufA[2*i+1];
+        const i16 bl = bufB[2*i], br = bufB[2*i+1];
+        // SIGNED volume constants — dividing by the u32 literal would promote
+        // negative products to unsigned (the bug class this test guards).
+        const i32 vMax = static_cast<i32>(kVolMax);
+        const i32 vHalf = vMax / 2;
+        // Submit 1: A at full volume (both channels).
+        if (s[off1 + 2*i]     != clamp16((al * vMax) / vMax)) allMixOk = false;
+        if (s[off1 + 2*i + 1] != clamp16((ar * vMax) / vMax)) allMixOk = false;
+        // Submit 2: volume clamped — L stayed max, R clamped from -5 to 0.
+        if (s[off2 + 2*i]     != clamp16((al * vMax) / vMax)) allMixOk = false;
+        if (s[off2 + 2*i + 1] != clamp16((ar * 0) / vMax))    allMixOk = false;
+        // Submit 3+4: one window, summed (A full + B half), single clamp.
+        const i32 wantL = (al * vMax) / vMax + (bl * vHalf) / vMax;
+        const i32 wantR = (ar * vMax) / vMax + (br * vHalf) / vMax;
+        if (s[off3 + 2*i]     != clamp16(wantL) ||
+            s[off3 + 2*i + 1] != clamp16(wantR)) allMixOk = false;
+    }
+    CHECK(allMixOk);
+
+    const Mixer::Stats st = mx.stats();
+    CHECK(st.droppedFrames == 0);
+    CHECK(st.submittedFrames == 300);   // frontier: 3 unique master windows
+
+    mx.clearBackend();   // now tear the backend down (dump already read)
+    return true;
+}
+
+bool test_audio_wav_file() {
+    using namespace psb;
+    // 50 ms of 440 Hz stereo for the header/length check.
+    std::vector<i16> samples(2400);
+    for (size_t i = 0; i < samples.size(); i += 2) {
+        const double t = static_cast<double>(i / 2) / 48000.0;
+        const i16 v = static_cast<i16>(std::sin(440.0 * 2.0 * 3.14159265358979
+                                                * t) * 20000.0);
+        samples[i] = v;
+        samples[i + 1] = v;
+    }
+    CHECK(psb::audio::writeWavFile("test_tone.wav", 48000, 2, samples.data(),
+                                   samples.size()));
+    CHECK(!psb::audio::writeWavFile("test_bad.wav", 0, 2, samples.data(),
+                                    samples.size()));
+    std::FILE* f = std::fopen("test_tone.wav", "rb");
+    CHECK(f != nullptr);
+    psb::u8 hdr[44];
+    CHECK(std::fread(hdr, 1, 44, f) == 44);
+    CHECK(std::memcmp(hdr, "RIFF", 4) == 0);
+    CHECK(std::memcmp(hdr + 8, "WAVE", 4) == 0);
+    CHECK(std::memcmp(hdr + 12, "fmt ", 4) == 0);
+    psb::u32 rate;
+    std::memcpy(&rate, hdr + 24, 4);
+    CHECK(rate == 48000);
+    psb::u32 dataBytes;
+    std::memcpy(&dataBytes, hdr + 40, 4);
+    CHECK(dataBytes == samples.size() * 2);
+    i16 first;
+    CHECK(std::fread(&first, 2, 1, f) == 1);
+    CHECK(first == samples[0]);
+    std::fclose(f);
+    std::filesystem::remove("test_tone.wav");
+    std::filesystem::remove("test_bad.wav");   // must not exist; ignore
+    return true;
+}
+
+bool test_pad_unit() {
+    using namespace psb;
+    pad::PadService& svc = pad::PadService::get();
+
+    auto driver = std::make_unique<pad::ScriptedPadDriver>();
+    pad::ScriptedPadDriver* scr = driver.get();
+    CHECK(scr->loadFromString(
+        "# scripted events\n"
+        "100 1 200 100 60 90 10 20\n"      // Cross at 100 ms, moved sticks
+        "200 GYRO 0.10 0.20 -0.98 15 0 -7\n"
+        "300 100 128 128 128 128 0 255\n")); // Options at 300 ms, R2 full
+    svc.setDriver(std::move(driver));
+
+    CHECK(svc.open(0, 0, 0, nullptr) == 1);
+    CHECK(svc.open(1, 0, 0, nullptr) == -1);   // bad user
+    CHECK(svc.open(0, 5, 0, nullptr) == -1);   // bad type
+    CHECK(svc.open(0, 0, 3, nullptr) == -1);   // bad index
+
+    pad::PadState st{};
+    // Before the first event: neutral, disconnected.
+    time::TimeDomain::get().enableVirtual(50'000);   // 50 ms
+    svc.poll();
+    CHECK(svc.readState(1, &st) == 0);
+    CHECK(st.connected == 0);
+
+    // At 150 ms: Cross held, sticks as scripted.
+    time::TimeDomain::get().enableVirtual(150'000);
+    svc.poll();
+    CHECK(svc.readState(1, &st) == 0);
+    CHECK(st.connected == 1);
+    CHECK(st.buttons == pad::PadBtnCross);
+    CHECK(st.lx == 200 && st.ly == 100 && st.rx == 60 && st.ry == 90);
+    CHECK(st.l2 == 10 && st.r2 == 20);
+    CHECK(st.timestampUs == 100'000);
+
+    // At 250 ms: gyro values from the GYRO event.
+    time::TimeDomain::get().enableVirtual(250'000);
+    svc.poll();
+    CHECK(svc.readState(1, &st) == 0);
+    CHECK(st.gyroX == 15.f && st.gyroZ == -7.f);
+    CHECK(st.accelY == 0.20f);
+
+    // Batch read + controller information.
+    psb::u32 returned = 99;
+    CHECK(svc.read(1, &st, 4, &returned) == 0);
+    CHECK(returned == 1);
+    pad::ControllerInfo info{};
+    CHECK(svc.getControllerInformation(1, &info) == 0);
+    CHECK(info.connectedCount == 1);
+    CHECK(info.touchpixW == 1920);
+
+    // Error paths.
+    CHECK(svc.readState(7, &st) == -1);
+    CHECK(svc.getControllerInformation(7, &info) == -1);
+
+    svc.clearDriver();
+    time::TimeDomain::get().disableVirtual();
+    time::TimeDomain::get().init();
+    return true;
+}
+
+bool test_net_stubs() {
+    using namespace psb;
+    net::resetCounters();
+    CHECK(sceNetInit(0) == net::kErrUnavailable);
+    CHECK(sceNetSocket("t", 2, 1, 6) == net::kErrUnavailable);
+    CHECK(sceNetConnect(1, nullptr, 0) == net::kErrNotInitialized);
+    CHECK(sceNetSend(1, "x", 1, 0) == net::kErrNotInitialized);
+    CHECK(sceNetCtlGetState(nullptr) == 0);
+    const net::Stats s = net::stats();
+    CHECK(s.calls == 5);
+    CHECK(s.refused == 4);       // GetState succeeds (reports disconnected)
+    CHECK(s.logged == 5);        // all five fully logged (below the cap)
+    net::resetCounters();
+    CHECK(net::stats().calls == 0);
+    return true;
+}
 bool test_guest_abi_probe() {
     psb::Emulator emu;
     psb::EmuOptions opt;
@@ -774,6 +1059,153 @@ bool test_guest_cube_vm() {
     CHECK(st.threadsDetached == 0);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Phase-4 end-to-end guest suite.
+// ---------------------------------------------------------------------------
+bool test_guest_net_probe() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    const psb::EmuStats st = emu.run("net_probe.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    CHECK(st.netStubCalls >= 13);   // every documented surface call
+    return true;
+}
+
+bool test_guest_audio_tone() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.audioDump = "test_audio_tone.wav";   // deterministic WAV evidence
+    const psb::EmuStats st = emu.run("audio_tone.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);
+    CHECK(st.audioDroppedFrames == 0);       // INVARIANT: zero drops
+    CHECK(st.audioSubmittedFrames == 24000); // 2 sections x 12000 frames
+    CHECK(st.audioMaxLatencyMs <= 30);       // below the 40 ms acceptance
+
+    // Decode + verify the dump: exact length, section frequencies via zero
+    // crossings, and the mixed section = A + B/2 (±2 LSB float rounding).
+    std::FILE* f = std::fopen("test_audio_tone.wav", "rb");
+    CHECK(f != nullptr);
+    psb::u8 hdr[44];
+    CHECK(std::fread(hdr, 1, 44, f) == 44);
+    psb::u32 dataBytes;
+    std::memcpy(&dataBytes, hdr + 40, 4);
+    CHECK(dataBytes == 24000 * 4);           // 24000 stereo s16 frames
+    std::vector<psb::i16> s(24000 * 2);
+    CHECK(std::fread(s.data(), 2, s.size(), f) == s.size());
+    std::fclose(f);
+
+    // Section 1 (frames 0..11999): 440 Hz solo. The dump is interleaved —
+    // analyze the LEFT channel only (even indices), frames not samples.
+    auto zeroCrossRate = [&](size_t beginFrame, size_t endFrame) -> double {
+        psb::u64 crossings = 0;
+        for (size_t f = beginFrame + 1; f < endFrame; ++f)
+            if ((s[2 * (f - 1)] < 0) != (s[2 * f] < 0)) ++crossings;
+        const double secs = static_cast<double>(endFrame - beginFrame) / 48000.0;
+        return static_cast<double>(crossings) / (2.0 * secs);
+    };
+    const double f1 = zeroCrossRate(0, 12000);
+    CHECK(f1 > 435.0 && f1 < 445.0);         // ~440 Hz solo section
+
+    // Section 2 (frames 12000..23999): mixed 660 (full) + 220 (half) — the
+    // 660 carrier sets the zero-crossing rate (ripple amplitude < carrier).
+    const double f2 = zeroCrossRate(12000, 24000);
+    CHECK(f2 > 600.0 && f2 < 720.0);         // ~660 Hz dominant
+
+    // Exact mix math on a quiet window: recompute the expected mixed sample
+    // from the guest formula (same libm on the same machine).
+    auto clamp16 = [](psb::i32 v) -> psb::i16 {
+        return static_cast<psb::i16>(v < -32768 ? -32768
+                                                   : (v > 32767 ? 32767 : v));
+    };
+    bool mixOk = true;
+    for (psb::u32 k = 0; k < 800 && mixOk; ++k) {
+        const float a = 0.5f * std::sinf(660.f * 2.f * 3.14159265f *
+                                         static_cast<float>(k) / 48000.f);
+        const float b = 0.5f * std::sinf(220.f * 2.f * 3.14159265f *
+                                         static_cast<float>(k) / 48000.f);
+        const psb::i32 la = static_cast<psb::i32>(a * 32767.f);
+        const psb::i32 lb = static_cast<psb::i32>(b * 32767.f);
+        const psb::i32 vMax = static_cast<psb::i32>(psb::audio::kVolMax);
+        const psb::i32 vHalf = vMax / 2;
+        const psb::i16 want = clamp16(
+            clamp16((la * vMax) / vMax) + clamp16((lb * vHalf) / vMax));
+        const psb::i16 got = s[(12000 + k) * 2];
+        const int diff = std::abs(static_cast<int>(want) - static_cast<int>(got));
+        if (diff > 2) mixOk = false;
+    }
+    CHECK(mixOk);
+    std::filesystem::remove("test_audio_tone.wav");
+    return true;
+}
+
+bool test_guest_audio_paced() {
+    // Paced run: frame-clock audio pulls active -> backpressure + measured
+    // queue latency, still zero drops (glitch-free under load).
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.audioDump = "test_audio_paced.wav";
+    opt.targetFps = 60;
+    const psb::EmuStats st = emu.run("audio_tone.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    CHECK(st.audioDroppedFrames == 0);
+    CHECK(st.audioSubmittedFrames == 24000);
+    CHECK(st.audioMaxLatencyMs > 0);         // paced path exercised
+    CHECK(st.audioMaxLatencyMs <= 30);       // < 40 ms acceptance
+    CHECK(st.frameMeanIntervalMs > 10.0);    // presentation paced
+    CHECK(st.frameMeanIntervalMs < 25.0);
+    std::filesystem::remove("test_audio_paced.wav");
+    return true;
+}
+
+bool test_guest_input_latency() {
+    // Scripted DualSense input at 60 FPS pacing. The guest self-fails
+    // (exit 1) when any observed press exceeds the 25 ms budget.
+    {
+        std::FILE* f = std::fopen("test_pad_script.txt", "w");
+        CHECK(f != nullptr);
+        std::fputs("# PSBET scripted pad events\n"
+                   "100 1 128 128 128 128 0 0\n"     // Cross @ 100 ms
+                   "150 0 128 128 128 128 0 0\n"     // release
+                   "200 GYRO 0.10 0.20 -0.98 12 0 -6\n"
+                   "300 100 128 128 128 128 0 255\n",// Options @ 300 ms
+                   f);
+        std::fclose(f);
+    }
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.padScript = "test_pad_script.txt";
+    opt.targetFps = 60;
+    const psb::EmuStats st = emu.run("input_demo.elf", opt);
+    CHECK(st.guestExitCode == 0);            // press inside budget + Options
+    CHECK(!st.crashed);
+    CHECK(st.threadsDetached == 0);
+    CHECK(st.frameMeanIntervalMs > 10.0);    // 60 FPS pacing held
+    CHECK(st.frameMeanIntervalMs < 25.0);
+    std::filesystem::remove("test_pad_script.txt");
+    return true;
+}
+
+bool test_guest_paced_cube() {
+    // Target-FPS authorization on the GPU workload: 60 frames at 60 FPS.
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.width = 320; opt.height = 180;
+    opt.maxFrames = 60;
+    opt.targetFps = 60;
+    const psb::EmuStats st = emu.run("cube.elf", opt);
+    CHECK(st.guestExitCode == 124);
+    CHECK(st.frames == 60);
+    CHECK(st.frameMeanIntervalMs > 14.0);    // paced, not free-run
+    CHECK(st.frameMeanIntervalMs < 20.0);
+    CHECK(st.frameMaxIntervalMs < 100.0);    // no stall outliers
+    CHECK(!st.crashed);
+    return true;
+}
 #endif
 
 } // namespace
@@ -792,6 +1224,11 @@ int main() {
     runTest("rasterizer",               test_rasterizer);
     runTest("rasterizer_depth",         test_rasterizer_depth_ordering);
     runTest("cmd_executor",             test_cmd_executor);
+    runTest("timing_domain (24h simulated soak)", test_timing_domain);
+    runTest("audio_unit (mixer/ports/volume)", test_audio_unit);
+    runTest("audio_wav_file",            test_audio_wav_file);
+    runTest("pad_unit (scripted driver)", test_pad_unit);
+    runTest("net_stubs (documented refusals)", test_net_stubs);
 #ifdef PSBET_RUN_GUEST_TESTS
     runTest("guest_hello (threads/TLS/sync)", test_guest_hello);
     runTest("guest_worker_exit (flaw-1 regression)", test_guest_worker_exit);
@@ -801,6 +1238,11 @@ int main() {
     runTest("guest_fs_demo (VFS + app0)",     test_guest_fs_demo);
     runTest("guest_syscall_probe (containment)", test_guest_syscall_probe);
     runTest("guest_cube_vm (GPU-VA draws)",   test_guest_cube_vm);
+    runTest("guest_net_probe (stub surface)", test_guest_net_probe);
+    runTest("guest_audio_tone (mix + WAV)",   test_guest_audio_tone);
+    runTest("guest_audio_paced (latency<40ms)", test_guest_audio_paced);
+    runTest("guest_input_latency (<25ms@60)", test_guest_input_latency);
+    runTest("guest_paced_cube (60 FPS auth)", test_guest_paced_cube);
     runTest("loader_et_exec (absolute vaddrs)", test_loader_et_exec_static);
     runTest("loader_dyn_offset (non-zero lo)",  test_loader_dyn_offset_static);
     runTest("loader_irelative_relro",           test_loader_irelative_relro);

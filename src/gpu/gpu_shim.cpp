@@ -9,6 +9,9 @@
 #include "core/kernel_shim.h"
 #include "core/memory.h"
 #include "core/guest_vm.h"
+#include "core/pacer.h"
+#include "core/audio.h"
+#include "core/pad.h"
 #include "psbet/psb_guest_api.h"
 
 namespace psb::gpu {
@@ -33,6 +36,34 @@ Device::~Device() = default;
 
 void setActiveDevice(Device* device) { g_device = device; }
 Device* activeDevice()               { return g_device; }
+
+void Device::setFrameClock(av::FramePacer* pacer, audio::Mixer* mixer) {
+    pacer_ = pacer;
+    mixer_ = mixer;
+}
+
+void Device::setPresenter(av::IPresenter* presenter) { presenter_ = presenter; }
+
+void Device::completeFrame() {
+    // Phase-4 order: vsync backpressure -> count/hook/limit -> present ->
+    // pace to the authorized slot -> frame-clock audio pull -> pad refresh.
+    if (pacer_) pacer_->onFrameSubmitted();
+
+    frames_++;
+    if (hook_) hook_(frames_);
+    if (frames_ >= maxFrames_ && !frameLimitHit_) {
+        frameLimitHit_ = true;
+        LOG_WARN("GPU: frame limit %llu reached — requesting guest exit(124)",
+                 static_cast<unsigned long long>(maxFrames_));
+        kernel::KernelState::get().requestProcessExit(124);
+    }
+
+    if (presenter_) presenter_->present(color_, width_, height_);
+    if (pacer_) pacer_->onFramePresented();
+    if (mixer_)
+        mixer_->onFramePresented(pacer_ ? pacer_->stats().authorizedFps : 0);
+    pad::PadService::get().poll();   // engine-side input refresh per frame
+}
 
 bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
     const u8* cursor = static_cast<const u8*>(data);
@@ -149,17 +180,6 @@ bool Device::executeCommandBuffer(const void* data, u32 sizeBytes) {
 
     backend_->frameEnd(); // Vulkan: submit + readback; software: no-op
     return true;
-}
-
-void Device::completeFrame() {
-    frames_++;
-    if (hook_) hook_(frames_);
-    if (frames_ >= maxFrames_ && !frameLimitHit_) {
-        frameLimitHit_ = true;
-        LOG_WARN("GPU: frame limit %llu reached — requesting guest exit(124)",
-                 static_cast<unsigned long long>(maxFrames_));
-        kernel::KernelState::get().requestProcessExit(124);
-    }
 }
 
 #if defined(_WIN32)

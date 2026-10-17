@@ -78,6 +78,18 @@ jobs:
           ./psbet run equeue_demo.elf
           ./psbet run syscall_probe.elf --syscall-trap on
 
+      # Phase 4: audio (WAV-dump evidence), scripted pad latency, net stubs.
+      # The paced run authorizes 60 FPS — the mixer drains on frame present,
+      # so the tone is glued to video pacing and the latency metric is real.
+      - name: Phase-4 live demo — audio out, input latency, net stubs
+        working-directory: build
+        run: |
+          ./psbet run audio_tone.elf --fps 60 --audio-dump tone.wav
+          ls -la tone.wav
+          printf '100 1 128 128 128 128 0 0\n150 0 128 128 128 128 0 0\n200 GYRO 0.10 0.20 -0.98 12 0 -6\n300 100 128 128 128 128 0 255\n' > pad.txt
+          ./psbet run input_demo.elf --fps 60 --pad-script pad.txt
+          ./psbet run net_probe.elf
+
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
@@ -92,6 +104,9 @@ jobs:
             build/fs_demo.elf
             build/equeue_demo.elf
             build/syscall_probe.elf
+            build/audio_tone.elf
+            build/input_demo.elf
+            build/net_probe.elf
 
       - name: Upload Vulkan demo screenshots
         uses: actions/upload-artifact@v4
@@ -123,6 +138,9 @@ jobs:
             build/abi_probe.elf
             build/fs_demo.elf
             build/equeue_demo.elf
+            build/audio_tone.elf
+            build/input_demo.elf
+            build/net_probe.elf
 
   linux-asan:
     name: Linux ASan/UBSan
@@ -207,6 +225,29 @@ jobs:
           Release\psbet.exe run ..\guests\worker_exit.elf
           echo "exit: $LASTEXITCODE"
           if ($LASTEXITCODE -ne 7) { exit $LASTEXITCODE }
+
+      # Phase 4: the Windows thunk surface now covers audio/pad/net/counter
+      # (arities 0-6). net_probe + audio_tone (null audio backend) + input_demo
+      # (null pad driver — pads disconnected) are hard gates.
+      - name: Run net_probe.elf on Windows (Phase-4 surface — hard gate)
+        working-directory: build
+        timeout-minutes: 5
+        run: |
+          Release\psbet.exe run ..\guests\net_probe.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run audio_tone.elf on Windows (Phase-4 surface — hard gate)
+        working-directory: build
+        timeout-minutes: 5
+        run: |
+          Release\psbet.exe run ..\guests\audio_tone.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # input_demo on Windows would loop on a disconnected pad (no scripted
+      # driver wired in this job) — the disconnected state is already covered
+      # by pad_unit in the core suite above.
 
       # cube renders through the parked-thread exit path (frame limit);
       # kept diagnostic while the Windows park accounting is observed.

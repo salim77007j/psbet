@@ -262,6 +262,42 @@ thunk4 psbTWinGnmMapGpuVa,          psbXGnmMapGpuAddress          ; 4 args
 thunk2 psbTWinGnmUnmapGpuVa,        psbXGnmUnmapGpuAddress        ; 2 args
 thunk0 psbTWinStackChkFail,         psbXStackChkFail
 
+; --- Phase-4 audio / pad / net / counter surface -------------------------------
+; Arity audit (SysV arg counts):
+;   GetProcessTimeCounter/Frequency  0    AudioOutOpen     6
+;   AudioOutOutput                   2    AudioOutSetVolume 3
+;   AudioOutClose                    1    PadOpen          4
+;   PadReadState                     2    PadRead          4
+;   PadGetControllerInformation      2    NetInit          1
+;   NetTerm                          0    NetSocket        4
+;   NetConnect/Bind                  3    NetListen        2
+;   NetAccept                        3    NetSend/Recv     4
+;   NetCloseSocket                   1    NetCtlInit/Term  0
+;   NetCtlGetState                   1
+thunk0 psbTWinGetProcessTimeCounter,       psbXSysGetProcessTimeCounter
+thunk0 psbTWinGetProcessTimeCounterFrequency, psbXSysGetProcessTimeCounterFrequency
+thunk6 psbTWinAudioOutOpen,                psbXAudioOutOpen              ; 6 args
+thunk2 psbTWinAudioOutOutput,              psbXAudioOutOutput
+thunk3 psbTWinAudioOutSetVolume,           psbXAudioOutSetVolume
+thunk1 psbTWinAudioOutClose,               psbXAudioOutClose
+thunk4 psbTWinPadOpen,                     psbXPadOpen
+thunk2 psbTWinPadReadState,                psbXPadReadState
+thunk4 psbTWinPadRead,                     psbXPadRead
+thunk2 psbTWinPadGetControllerInformation, psbXPadGetControllerInformation
+thunk1 psbTWinNetInit,                     psbXNetInit
+thunk0 psbTWinNetTerm,                     psbXNetTerm
+thunk4 psbTWinNetSocket,                   psbXNetSocket
+thunk3 psbTWinNetConnect,                  psbXNetConnect
+thunk3 psbTWinNetBind,                     psbXNetBind
+thunk2 psbTWinNetListen,                   psbXNetListen
+thunk3 psbTWinNetAccept,                   psbXNetAccept
+thunk4 psbTWinNetSend,                     psbXNetSend
+thunk4 psbTWinNetRecv,                     psbXNetRecv
+thunk1 psbTWinNetCloseSocket,              psbXNetCloseSocket
+thunk0 psbTWinNetCtlInit,                  psbXNetCtlInit
+thunk0 psbTWinNetCtlTerm,                  psbXNetCtlTerm
+thunk1 psbTWinNetCtlGetState,              psbXNetCtlGetState
+
 ; --- Phase-3 ABI conformance probes -------------------------------------------
 ; Deterministic argument-position checks exercised by the abi_probe guest so
 ; every thunk arity (register args AND stack args) is CI-verified on Windows.

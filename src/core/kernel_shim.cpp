@@ -21,6 +21,10 @@
 #include "core/memory.h"
 #include "core/vfs.h"
 #include "core/syscall_trap.h"
+#include "core/timing.h"
+#include "core/audio.h"
+#include "core/pad.h"
+#include "core/net_stubs.h"
 #include "psbet/psb_guest_api.h"
 
 #if !defined(_WIN32)
@@ -124,6 +128,12 @@ void KernelState::init(MemoryManager* mem) {
     g_exitInFlight.store(0);   // allow a fresh exit path for this guest run
     g_shutdown.store(false);   // fresh cooperative-shutdown state
     g_wakeCv.notify_all();
+    // Guest clock domain (Phase 4): fresh origin per run + teardown-aware
+    // sleeps (exit/shutdown wake blocking guest timing primitives).
+    time::TimeDomain::get().init();
+    time::TimeDomain::get().setExitPoll(
+        [] { return KernelState::get().exitRequested(); },
+        [] { return shutdownRequested(); });
 }
 
 // --- cooperative wake state -------------------------------------------------
@@ -355,15 +365,15 @@ syscall_trap::Mode KernelState::syscallTrapMode() const {
     return trapMode_;
 }
 
-void KernelState::setProcessStart(u64 us) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    startUs_ = us;
+void KernelState::setProcessStart(u64) {
+    // Phase 4: the guest clock lives in the TimeDomain (fresh origin at
+    // KernelState::init). The emulator's host-side anchor is engine-internal
+    // bookkeeping and no longer feeds guest-visible time.
 }
 
 u64 KernelState::processTimeUs() const {
-    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    return static_cast<u64>(now) - startUs_;
+    // Monotonic + drift-free: derived from one origin sample, no accumulation.
+    return time::TimeDomain::get().us();
 }
 
 // ---------------------------------------------------------------------------
@@ -512,24 +522,35 @@ uint64_t sceKernelGetProcessTimeInTick(void) {
     return sceKernelGetProcessTime() * 1000ull;
 }
 
+uint64_t sceKernelGetProcessTimeCounter(void) {
+    // v1.3: counter domain == ns domain (frequency is a fixed 1 GHz).
+    return time::TimeDomain::get().ns();
+}
+
+uint64_t sceKernelGetProcessTimeCounterFrequency(void) {
+    return time::TimeDomain::kCounterFrequency;
+}
+
 int32_t sceKernelUsleep(uint64_t microseconds) {
-#if !defined(_WIN32)
-    ::usleep(static_cast<useconds_t>(microseconds));
-#else
-    Sleep(static_cast<DWORD>(microseconds / 1000));
-#endif
+    // Cooperative + exit-aware (Phase 4): a sleeping guest wakes when the
+    // process exit is requested or shutdown begins — sleeps can no longer
+    // stall teardown. Return value 0 in every case (documented).
+    time::TimeDomain::get().sleepUs(microseconds);
     return 0;
 }
 
 int32_t sceKernelNanosleep(uint64_t seconds, uint64_t nanoseconds) {
-    std::this_thread::sleep_for(std::chrono::seconds(seconds)
-                              + std::chrono::nanoseconds(nanoseconds));
+    // Overflow-safe total (huge requests clamp instead of wrapping).
+    const u64 usFromSec = seconds > (~0ull / 1'000'000ull)
+                              ? ~0ull : seconds * 1'000'000ull;
+    const u64 total = usFromSec > (~0ull - nanoseconds / 1000ull)
+                          ? ~0ull : usFromSec + nanoseconds / 1000ull;
+    time::TimeDomain::get().sleepUs(total);
     return 0;
 }
 
 int32_t sceKernelSleep(uint64_t seconds) {
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    return 0;
+    return sceKernelNanosleep(seconds, 0);
 }
 
 // ---- threads --------------------------------------------------------------
@@ -976,6 +997,10 @@ uint64_t psbXSysGetProcessTime(void)
     { return sceKernelGetProcessTime(); }
 uint64_t psbXSysGetProcessTimeInTick(void)
     { return sceKernelGetProcessTimeInTick(); }
+uint64_t psbXSysGetProcessTimeCounter(void)
+    { return sceKernelGetProcessTimeCounter(); }
+uint64_t psbXSysGetProcessTimeCounterFrequency(void)
+    { return sceKernelGetProcessTimeCounterFrequency(); }
 int32_t  psbXSysUsleep(uint64_t a)
     { return sceKernelUsleep(a); }
 int32_t  psbXSysNanosleep(uint64_t a, uint64_t b)
@@ -1156,6 +1181,19 @@ void psbTWinProbeCall1(void);            void psbTWinProbeCall2(void);
 void psbTWinProbeCall3(void);            void psbTWinProbeCall4(void);
 void psbTWinProbeCall5(void);            void psbTWinProbeCall6(void);
 void psbTWinProbePtr2(void);
+// Phase 4: audio / pad / net / counter surface.
+void psbTWinGetProcessTimeCounter(void); void psbTWinGetProcessTimeCounterFrequency(void);
+void psbTWinAudioOutOpen(void);          void psbTWinAudioOutOutput(void);
+void psbTWinAudioOutSetVolume(void);     void psbTWinAudioOutClose(void);
+void psbTWinPadOpen(void);               void psbTWinPadReadState(void);
+void psbTWinPadRead(void);               void psbTWinPadGetControllerInformation(void);
+void psbTWinNetInit(void);               void psbTWinNetTerm(void);
+void psbTWinNetSocket(void);             void psbTWinNetConnect(void);
+void psbTWinNetBind(void);               void psbTWinNetListen(void);
+void psbTWinNetAccept(void);             void psbTWinNetSend(void);
+void psbTWinNetRecv(void);               void psbTWinNetCloseSocket(void);
+void psbTWinNetCtlInit(void);            void psbTWinNetCtlTerm(void);
+void psbTWinNetCtlGetState(void);
 }
 #define W(name) psbTWin##name
 const Export kExports[] = {
@@ -1164,6 +1202,9 @@ const Export kExports[] = {
     {"sceKernelGetDirectMemorySize",  (void*)&W(GetDirectMemorySize)},
     {"sceKernelGetProcessTime",       (void*)&W(GetProcessTime)},
     {"sceKernelGetProcessTimeInTick", (void*)&W(GetProcessTimeInTick)},
+    {"sceKernelGetProcessTimeCounter",(void*)&W(GetProcessTimeCounter)},
+    {"sceKernelGetProcessTimeCounterFrequency",
+                                      (void*)&W(GetProcessTimeCounterFrequency)},
     {"sceKernelUsleep",               (void*)&W(Usleep)},
     {"sceKernelNanosleep",            (void*)&W(Nanosleep)},
     {"sceKernelSleep",                (void*)&W(Sleep)},
@@ -1213,6 +1254,29 @@ const Export kExports[] = {
     {"psbProbeCall5",                 (void*)&W(ProbeCall5)},
     {"psbProbeCall6",                 (void*)&W(ProbeCall6)},
     {"psbProbePtr2",                  (void*)&W(ProbePtr2)},
+    // Phase 4: audio out / pad / net (thunks live in w64_thunks.asm; the
+    // psbXAudio*/psbXPad*/psbXNet* forwarders live in their modules).
+    {"sceAudioOutOpen",               (void*)&W(AudioOutOpen)},
+    {"sceAudioOutOutput",             (void*)&W(AudioOutOutput)},
+    {"sceAudioOutSetVolume",          (void*)&W(AudioOutSetVolume)},
+    {"sceAudioOutClose",              (void*)&W(AudioOutClose)},
+    {"scePadOpen",                    (void*)&W(PadOpen)},
+    {"scePadReadState",               (void*)&W(PadReadState)},
+    {"scePadRead",                    (void*)&W(PadRead)},
+    {"scePadGetControllerInformation",(void*)&W(PadGetControllerInformation)},
+    {"sceNetInit",                    (void*)&W(NetInit)},
+    {"sceNetTerm",                    (void*)&W(NetTerm)},
+    {"sceNetSocket",                  (void*)&W(NetSocket)},
+    {"sceNetConnect",                 (void*)&W(NetConnect)},
+    {"sceNetBind",                    (void*)&W(NetBind)},
+    {"sceNetListen",                  (void*)&W(NetListen)},
+    {"sceNetAccept",                  (void*)&W(NetAccept)},
+    {"sceNetSend",                    (void*)&W(NetSend)},
+    {"sceNetRecv",                    (void*)&W(NetRecv)},
+    {"sceNetCloseSocket",             (void*)&W(NetCloseSocket)},
+    {"sceNetCtlInit",                 (void*)&W(NetCtlInit)},
+    {"sceNetCtlTerm",                 (void*)&W(NetCtlTerm)},
+    {"sceNetCtlGetState",             (void*)&W(NetCtlGetState)},
 };
 #undef W
 #else
@@ -1222,6 +1286,9 @@ const Export kExports[] = {
     {"sceKernelGetDirectMemorySize",  (void*)&sceKernelGetDirectMemorySize},
     {"sceKernelGetProcessTime",       (void*)&sceKernelGetProcessTime},
     {"sceKernelGetProcessTimeInTick", (void*)&sceKernelGetProcessTimeInTick},
+    {"sceKernelGetProcessTimeCounter",(void*)&sceKernelGetProcessTimeCounter},
+    {"sceKernelGetProcessTimeCounterFrequency",
+                                      (void*)&sceKernelGetProcessTimeCounterFrequency},
     {"sceKernelUsleep",               (void*)&sceKernelUsleep},
     {"sceKernelNanosleep",            (void*)&sceKernelNanosleep},
     {"sceKernelSleep",                (void*)&sceKernelSleep},
@@ -1271,6 +1338,28 @@ const Export kExports[] = {
     {"psbProbeCall5",                 (void*)&psbProbeCall5},
     {"psbProbeCall6",                 (void*)&psbProbeCall6},
     {"psbProbePtr2",                  (void*)&psbProbePtr2},
+    // Phase 4: audio out / pad / net (defined in their engine modules).
+    {"sceAudioOutOpen",               (void*)&psb::audio::sceAudioOutOpen},
+    {"sceAudioOutOutput",             (void*)&psb::audio::sceAudioOutOutput},
+    {"sceAudioOutSetVolume",          (void*)&psb::audio::sceAudioOutSetVolume},
+    {"sceAudioOutClose",              (void*)&psb::audio::sceAudioOutClose},
+    {"scePadOpen",                    (void*)&scePadOpen},
+    {"scePadReadState",               (void*)&scePadReadState},
+    {"scePadRead",                    (void*)&scePadRead},
+    {"scePadGetControllerInformation",(void*)&scePadGetControllerInformation},
+    {"sceNetInit",                    (void*)&sceNetInit},
+    {"sceNetTerm",                    (void*)&sceNetTerm},
+    {"sceNetSocket",                  (void*)&sceNetSocket},
+    {"sceNetConnect",                 (void*)&sceNetConnect},
+    {"sceNetBind",                    (void*)&sceNetBind},
+    {"sceNetListen",                  (void*)&sceNetListen},
+    {"sceNetAccept",                  (void*)&sceNetAccept},
+    {"sceNetSend",                    (void*)&sceNetSend},
+    {"sceNetRecv",                    (void*)&sceNetRecv},
+    {"sceNetCloseSocket",             (void*)&sceNetCloseSocket},
+    {"sceNetCtlInit",                 (void*)&sceNetCtlInit},
+    {"sceNetCtlTerm",                 (void*)&sceNetCtlTerm},
+    {"sceNetCtlGetState",             (void*)&sceNetCtlGetState},
 };
 #endif // _WIN32
 

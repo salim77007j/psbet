@@ -17,6 +17,11 @@
 #include "core/cpu_supervisor.h"
 #include "core/vfs.h"
 #include "core/syscall_trap.h"
+#include "core/timing.h"
+#include "core/audio.h"
+#include "core/pad.h"
+#include "core/net_stubs.h"
+#include "core/pacer.h"
 #include "gpu/gpu_shim.h"
 #include "gpu/png.h"
 #include "gpu/vulkan_device.h"
@@ -76,6 +81,7 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
         stats.guestExitCode = 2;
         return stats;
     }
+    net::resetCounters();
 
     syscall_trap::Mode trapMode = syscall_trap::Mode::On;
     if (opt.syscallTrap == "off") trapMode = syscall_trap::Mode::Off;
@@ -90,6 +96,69 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     }
     kernel::KernelState::get().init(&mem);
     kernel::KernelState::get().setProcessStart(t0);
+
+    // ---- 1b. Audio / input / pacing services (Phase 4) -----------------------
+    // Audio backend: WAV dump when requested (deterministic CI evidence),
+    // SDL3 playback when built, null otherwise.
+    std::unique_ptr<audio::IAudioBackend> audioBackend;
+    if (!opt.audioDump.empty())
+        audioBackend = std::make_unique<audio::WavDumpBackend>(opt.audioDump);
+#ifdef PSBET_WITH_SDL3
+    else
+        audioBackend = std::make_unique<audio::SdlBackend>();
+#endif
+    if (!audioBackend)
+        audioBackend = std::make_unique<audio::NullBackend>();
+    audio::Mixer::get().setBackend(std::move(audioBackend));
+
+    // Input driver: scripted events (deterministic) else SDL gamepads (when
+    // built) else null (all pads disconnected).
+    std::unique_ptr<pad::IPadDriver> padDriver;
+    if (!opt.padScript.empty()) {
+        auto scripted = std::make_unique<pad::ScriptedPadDriver>();
+        if (!scripted->loadFromFile(opt.padScript.c_str())) {
+            LOG_ERROR("Emulator: pad script invalid: %s", opt.padScript.c_str());
+            audio::Mixer::get().clearBackend();
+            stats.guestExitCode = 2;
+            return stats;
+        }
+        LOG_INFO("Emulator: scripted pad driver active (%u events)",
+                 scripted->eventCount());
+        padDriver = std::move(scripted);
+#ifdef PSBET_WITH_SDL3
+    } else {
+        padDriver = std::make_unique<pad::SdlGamepadDriver>();
+#endif
+    }
+    if (!padDriver)
+        padDriver = std::make_unique<pad::NullPadDriver>();
+    pad::PadService::get().setDriver(std::move(padDriver));
+
+    // Presentation: SDL3 window when built + requested, offscreen otherwise.
+    av::OffscreenPresenter offscreenPresenter;
+    av::IPresenter* presenter = &offscreenPresenter;
+    stats.presenterUsed = offscreenPresenter.name();
+#ifdef PSBET_WITH_SDL3
+    std::unique_ptr<av::SdlPresenter> windowPresenter;
+    if (opt.window == "on") {
+        windowPresenter = std::make_unique<av::SdlPresenter>(opt.width, opt.height);
+        if (windowPresenter->valid()) {
+            presenter = windowPresenter.get();
+            stats.presenterUsed = presenter->name();
+        } else {
+            LOG_WARN("Emulator: SDL window unavailable — staying offscreen");
+            windowPresenter.reset();
+        }
+    }
+#else
+    if (opt.window == "on")
+        LOG_WARN("Emulator: --window requested but this build has no SDL3 "
+                 "(PSBET_WITH_SDL3) — staying offscreen");
+#endif
+
+    // Frame pacing: target-FPS authorization (console boost-mode analogue).
+    av::FramePacer pacer;
+    pacer.configure(opt.targetFps, opt.vsync);
 
     // ---- 2. Load guest image ----------------------------------------------
     std::vector<ImportFn> resolvers{&resolveImports};
@@ -164,6 +233,8 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     }
     device->setMaxFrames(opt.maxFrames);
     device->setAddressSpace(&mem.guest());   // GPU-VA draws (PBFF v1.1)
+    device->setFrameClock(&pacer, &audio::Mixer::get());
+    device->setPresenter(presenter);
     gpu::setActiveDevice(device.get());
 
     if (!opt.screenshotDir.empty()) {
@@ -203,6 +274,13 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     // ---- 5. Teardown + stats -----------------------------------------------
     kernel::KernelState::get().shutdownThreads();
     vfs::shutdown();
+    // Snapshot service stats BEFORE teardown (clearBackend resets counters).
+    const char* audioBackendName = audio::Mixer::get().backendName();
+    const audio::Mixer::Stats audioStats = audio::Mixer::get().stats();
+    const av::FramePacer::Stats pacerStats = pacer.stats();
+    const net::Stats netStats = net::stats();
+    pad::PadService::get().clearDriver();
+    audio::Mixer::get().clearBackend();   // flush WAV dumps, stop consumers
 
     stats.guestExitCode = run.exitCode;
     stats.exitedViaGuest = run.exitedViaGuest;
@@ -220,6 +298,18 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     stats.threadsDetached = ts.detached;
     stats.threadsParked = ts.parked;
     stats.memoryUsedBytes = mem.bytesAllocated();
+
+    // Phase-4 service accounting (snapshotted before teardown above).
+    stats.audioBackendUsed = audioBackendName;
+    stats.audioSubmittedFrames = audioStats.submittedFrames;
+    stats.audioMixedFrames = audioStats.mixedFrames;
+    stats.audioDroppedFrames = audioStats.droppedFrames;
+    stats.audioMaxLatencyMs = audioStats.maxLatencyMs;
+    stats.audioBackpressureWaits = audioStats.backpressureWaits;
+    stats.frameMeanIntervalMs = pacerStats.meanIntervalMs;
+    stats.frameMaxIntervalMs = pacerStats.maxIntervalMs;
+    stats.vsyncWaits = pacerStats.vsyncWaits;
+    stats.netStubCalls = netStats.calls;
 
     if (stats.crashed) {
         LOG_ERROR("Emulator: guest crashed — see crash report");

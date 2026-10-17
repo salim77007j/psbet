@@ -11,11 +11,22 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Strict warnings on GCC/Clang — "zero errors" is enforced at compile time.
+# -Wall/-Wextra are global (third-party fetched deps compile with warnings
+# visible but non-fatal); -Werror is attached per-target to PSBET's own code
+# below, because vendored SDL3 sources do not commit to warning-free builds
+# under our flag set.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-Wall -Wextra -Werror)
+  add_compile_options(-Wall -Wextra)
 endif()
 
 find_package(Threads REQUIRED)
+
+# PSBET's own code builds with -Werror (see note above).
+function(psbet_strict_warnings tgt)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${tgt} PRIVATE -Werror)
+  endif()
+endfunction()
 
 # Windows guest-hosting shim: SysV->Win64 ABI thunks (MASM), MSVC only.
 if(MSVC)
@@ -36,6 +47,11 @@ add_library(psbet_core STATIC
   src/core/vfs.cpp
   src/core/pfs.cpp
   src/core/syscall_trap.cpp
+  src/core/timing.cpp
+  src/core/audio.cpp
+  src/core/pad.cpp
+  src/core/net_stubs.cpp
+  src/core/pacer.cpp
   src/gpu/png.cpp
   src/gpu/spirv_emit.cpp
   src/gpu/shader_cache.cpp
@@ -47,11 +63,38 @@ add_library(psbet_core STATIC
   src/emulator.cpp
 )
 
+# ---------------------------------------------------------------------------
+# SDL3 (OPTIONAL, Phase 4): real audio playback, gamepad input with gyro,
+# and the presentation window. Fetched and built from source so CI runners
+# and user machines need no system package. OFF keeps every backend on its
+# deterministic fallback (wav/null audio, scripted pad, offscreen present).
+# ---------------------------------------------------------------------------
+option(PSBET_WITH_SDL3 "Build with SDL3 audio/window/input backends" OFF)
+if(PSBET_WITH_SDL3)
+  include(FetchContent)
+  set(SDL_TESTS       OFF CACHE BOOL "" FORCE)
+  set(SDL_EXAMPLES    OFF CACHE BOOL "" FORCE)
+  set(SDL_SHARED      ON  CACHE BOOL "" FORCE)
+  set(SDL_STATIC      OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG        release-3.2.30
+    GIT_SHALLOW    TRUE)
+  FetchContent_MakeAvailable(SDL3)
+  target_sources(psbet_core PRIVATE
+    src/core/audio_sdl.cpp
+    src/core/pad_sdl.cpp)
+  target_link_libraries(psbet_core PUBLIC SDL3::SDL3)
+  target_compile_definitions(psbet_core PUBLIC PSBET_WITH_SDL3=1)
+  message(STATUS "PSBET: SDL3 enabled (audio/window/gamepad backends active)")
+endif()
+
 if(MSVC)
   target_sources(psbet_core PRIVATE src/platform/w64_thunks.asm)
 endif()
 target_include_directories(psbet_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(psbet_core PUBLIC Threads::Threads)
+psbet_strict_warnings(psbet_core)
 
 if(NOT WIN32)
   target_link_libraries(psbet_core PUBLIC ${CMAKE_DL_LIBS})
@@ -62,19 +105,23 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(psbet src/tools/psbet_main.cpp)
 target_link_libraries(psbet PRIVATE psbet_core)
+psbet_strict_warnings(psbet)
 
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
 add_executable(psbet_tests tests/run_tests.cpp)
 target_link_libraries(psbet_tests PRIVATE psbet_core)
+psbet_strict_warnings(psbet_tests)
 
 add_executable(psbet_rdna_tests tests/rdna_tests.cpp)
 target_link_libraries(psbet_rdna_tests PRIVATE psbet_core)
+psbet_strict_warnings(psbet_rdna_tests)
 
 # Fuzzed guest corpus (Phase 3): deterministic kernel-API stress + PBFF fuzz.
 add_executable(psbet_fuzz tests/corpus_fuzz.cpp)
 target_link_libraries(psbet_fuzz PRIVATE psbet_core)
+psbet_strict_warnings(psbet_fuzz)
 
 # ---------------------------------------------------------------------------
 # Guest test homebrew (ELF images for the loader to execute).
@@ -85,7 +132,7 @@ if(NOT MSVC AND NOT WIN32)
   # Guests are the "console side": they must never inherit host sanitizer
   # flags — ASan-instrumented guest code has no runtime to link against and
   # will crash the moment it executes. Force-clean compile and link.
-  set(GUEST_CFLAGS -shared -fPIC -nostartfiles -O2
+  set(GUEST_CFLAGS -shared -fPIC -nostartfiles -O2 -Werror
       -fno-sanitize=address -fno-sanitize=undefined
       -fno-stack-protector)
   set(GUEST_LDFLAGS -shared -nostartfiles -Wl,-e,psb_entry -Wl,--build-id=none
@@ -156,6 +203,31 @@ if(NOT MSVC AND NOT WIN32)
   target_link_options(hb_cube_vm PRIVATE ${GUEST_LDFLAGS})
   set_target_properties(hb_cube_vm PROPERTIES
     OUTPUT_NAME "cube_vm" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  # Phase-4 homebrew suite: audio out, pad input, net stub surface.
+  add_library(hb_audio_tone SHARED tests/homebrew/audio_tone.c)
+  target_include_directories(hb_audio_tone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_audio_tone PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_audio_tone PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_audio_tone PROPERTIES
+    OUTPUT_NAME "audio_tone" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_input_demo SHARED tests/homebrew/input_demo.c)
+  target_include_directories(hb_input_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_input_demo PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_input_demo PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_input_demo PROPERTIES
+    OUTPUT_NAME "input_demo" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_net_probe SHARED tests/homebrew/net_probe.c)
+  target_include_directories(hb_net_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_net_probe PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_net_probe PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_net_probe PROPERTIES
+    OUTPUT_NAME "net_probe" PREFIX "" SUFFIX ".elf"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()
 

@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 #include <filesystem>
+#include <memory>
 
 #include "psbet/common.h"
 #include "psbet/psb_guest_api.h"
@@ -33,6 +34,9 @@
 #include "core/vfs.h"
 #include "gpu/gpu_shim.h"
 #include "gpu/cmd_stream.h"
+#include "core/audio.h"
+#include "core/pad.h"
+#include "core/net_stubs.h"
 
 using namespace psb;
 
@@ -63,7 +67,9 @@ struct CorpusContext {
 //   C: alloc -> map -> double-map (must fail) -> unmap -> free
 //   D: mutex-protected shared counter across threads
 //   E: equeue producer/consumer with deterministic idents
-enum class Phase { A, B, C, D, E };
+//   F (Phase 4): audio ports (open/output/volume/close) + pad + net stubs —
+//      the mixer's drop invariant is checked after every seed.
+enum class Phase { A, B, C, D, E, F };
 
 bool runCorpusSeed(u64 seed) {
     CorpusContext ctx;
@@ -76,9 +82,9 @@ bool runCorpusSeed(u64 seed) {
     bool ok = true;
     const char* failAt = "-";
 
-    // Phase A/B/C on the model directly (in-process, no guests).
+    // Phase A/B/C/F on the model directly (in-process, no guests).
     for (int iter = 0; iter < 24; ++iter) {
-        const Phase phase = static_cast<Phase>(rng.next() % 3);
+        const Phase phase = static_cast<Phase>(rng.next() % 4);
         const u64 len = rng.range(0x1000, 0x10000);
         auto& gm = mem.guest();
 
@@ -94,6 +100,29 @@ bool runCorpusSeed(u64 seed) {
                 { ok = false; failAt = "A-verify"; }
             if (!gm.unmap(va, len)) { ok = false; failAt = "A-unmap"; }
             if (!gm.freeDirect(pa, len)) { ok = false; failAt = "A-free"; }
+        } else if (phase == Phase::F) {
+            // Audio/pad/net stress: random-but-valid calls; the mixer must
+            // never drop and every net stub must refuse.
+            const u32 len = static_cast<u32>(rng.range(1, 2000));
+            const i32 h = sceAudioOutOpen(0, PSB_AUDIO_PORT_MAIN, 0, len,
+                                          48000, PSB_AUDIO_FMT_S16_STEREO);
+            if (h >= 0) {
+                std::vector<i16> buf(len * 2, 1000);
+                const int submits = static_cast<int>(rng.range(1, 8));
+                for (int k = 0; k < submits; ++k)
+                    if (sceAudioOutOutput(h, buf.data()) != 0)
+                        { ok = false; failAt = "F-output"; break; }
+                i32 vol[2] = {32768, 16384};
+                (void)sceAudioOutSetVolume(h, 0x3, vol);
+                if (sceAudioOutClose(h) != 0) { ok = false; failAt = "F-close"; }
+            }
+            if (scePadOpen(0, 0, 0, nullptr) == 1) {
+                psb::pad::PadState st{};
+                if (psb::pad::PadService::get().readState(1, &st) != 0)
+                    { ok = false; failAt = "F-pad"; }
+            }
+            if (sceNetInit(0) != psb::net::kErrUnavailable)
+                { ok = false; failAt = "F-net"; }
         } else if (phase == Phase::B) {
             const u64 pa = gm.allocDirect(psb::GuestMemory::kPoolRegular, len,
                                           0x1000, 0, 0, "fuzz-b");
@@ -260,6 +289,12 @@ int main(int argc, char** argv) {
     std::printf("PSBET fuzz corpus (%llu seeds)\n================\n",
                 static_cast<unsigned long long>(seeds));
 
+    // Phase-4 services: reset the pad table; the mixer runs backend-less
+    // (drain-advance only) so the drop invariant is exercised, not masked.
+    psb::pad::PadService::get().setDriver(
+        std::make_unique<psb::pad::NullPadDriver>());
+    const u64 audioDroppedBefore = psb::audio::Mixer::get().stats().droppedFrames;
+
     u64 failed = 0;
     for (u64 s = 0; s < seeds; ++s) {
         if (!runCorpusSeed(s)) {
@@ -272,6 +307,14 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(s));
             ++failed;
         }
+    }
+
+    // Phase-4 invariant: the mixer NEVER drops (fuzz audio included).
+    const u64 droppedNow = psb::audio::Mixer::get().stats().droppedFrames;
+    if (droppedNow != audioDroppedBefore) {
+        std::printf("  [FUZZ] audio drop invariant violated (%llu dropped)\n",
+                    static_cast<unsigned long long>(droppedNow));
+        ++failed;
     }
 
     std::printf("-> fuzz: %llu seeds, %llu failures\n",

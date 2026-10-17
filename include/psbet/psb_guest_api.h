@@ -78,9 +78,11 @@ int32_t sceKernelWaitEqueue(int32_t eqId, PsbEqueueEvent* eventOut,
                             uint64_t timeoutUs);
 int32_t sceKernelCancelEvent(int32_t eqId, uint64_t ident);
 
-// ---- Time (microsecond / nanosecond clocks) ----------------------------------
+// ---- Time (microsecond / nanosecond clocks; v1.3 adds the counter API) ------
 uint64_t sceKernelGetProcessTime(void);          // microseconds since start
 uint64_t sceKernelGetProcessTimeInTick(void);    // PSBET ticks (1 tick = 1 ns)
+uint64_t sceKernelGetProcessTimeCounter(void);   // counter ticks (1 tick = 1 ns)
+uint64_t sceKernelGetProcessTimeCounterFrequency(void); // fixed: 1e9 Hz
 int32_t  sceKernelUsleep(uint64_t microseconds);
 int32_t  sceKernelNanosleep(uint64_t seconds, uint64_t nanoseconds);
 int32_t  sceKernelSleep(uint64_t seconds);
@@ -131,6 +133,91 @@ int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
                                    uint32_t* dcbSizesInBytes,
                                    void** ccbAddrs, uint32_t* ccbSizesInBytes,
                                    uint32_t flags);
+
+// ---- Audio out (v1.3 — GUEST_ABI §9) ---------------------------------------------
+// PSBET mixes every open port into one fixed 48 kHz stereo master stream
+// (guest-side mixing semantics). Port handles are 1-based; -1 on failure.
+#define PSB_AUDIO_FMT_S16_MONO     0u
+#define PSB_AUDIO_FMT_S16_STEREO   1u
+#define PSB_AUDIO_FMT_FLOAT_STEREO 2u
+#define PSB_AUDIO_PORT_MAIN        0u
+#define PSB_AUDIO_PORT_BGM         1u
+#define PSB_AUDIO_PORT_VOICE       2u
+#define PSB_AUDIO_VOL_MAX          32768
+#define PSB_AUDIO_CH_LEFT          0x1u
+#define PSB_AUDIO_CH_RIGHT         0x2u
+
+int32_t sceAudioOutOpen(int32_t userId, uint32_t portType, uint32_t index,
+                        uint32_t lenFrames, uint32_t freq, uint32_t format);
+int32_t sceAudioOutOutput(int32_t handle, void* ptr);       // submit lenFrames
+int32_t sceAudioOutSetVolume(int32_t handle, uint32_t chBitmask,
+                             int32_t* volumes);              // per-channel 0..MAX
+int32_t sceAudioOutClose(int32_t handle);
+
+// ---- Pad / input (v1.3 — GUEST_ABI §10) --------------------------------------------
+#define PSB_PAD_BTN_CROSS     (1u << 0)
+#define PSB_PAD_BTN_CIRCLE    (1u << 1)
+#define PSB_PAD_BTN_SQUARE    (1u << 2)
+#define PSB_PAD_BTN_TRIANGLE  (1u << 3)
+#define PSB_PAD_BTN_L1        (1u << 4)
+#define PSB_PAD_BTN_R1        (1u << 5)
+#define PSB_PAD_BTN_L2        (1u << 6)
+#define PSB_PAD_BTN_R2        (1u << 7)
+#define PSB_PAD_BTN_OPTIONS   (1u << 8)
+#define PSB_PAD_BTN_SHARE     (1u << 9)
+#define PSB_PAD_BTN_PS        (1u << 10)
+#define PSB_PAD_BTN_TOUCHPAD  (1u << 11)
+#define PSB_PAD_BTN_UP        (1u << 12)
+#define PSB_PAD_BTN_DOWN      (1u << 13)
+#define PSB_PAD_BTN_LEFT      (1u << 14)
+#define PSB_PAD_BTN_RIGHT     (1u << 15)
+#define PSB_PAD_BTN_L3        (1u << 16)
+#define PSB_PAD_BTN_R3        (1u << 17)
+
+typedef struct PsbPadState {
+    uint32_t buttons;
+    uint8_t  lx, ly, rx, ry;      // sticks 0..255 (center 128)
+    uint8_t  l2, r2;              // analog triggers 0..255
+    float    accelX, accelY, accelZ;   // g
+    float    gyroX, gyroY, gyroZ;      // deg/s
+    uint32_t connected;
+    uint64_t timestampUs;         // guest time this state became valid
+} PsbPadState;
+
+typedef struct PsbPadControllerInfo {
+    uint32_t touchpixW, touchpixH;   // touchpad pixel resolution
+    uint32_t touchresX, touchresY;   // touchpad sampling resolution
+    uint32_t connectionType;         // 0 none / 1 usb / 2 bluetooth
+    uint32_t connectedCount;
+} PsbPadControllerInfo;
+
+int32_t scePadOpen(int32_t userId, int32_t type, int32_t index,
+                   const void* param);
+int32_t scePadReadState(int32_t handle, PsbPadState* out);
+int32_t scePadRead(int32_t handle, PsbPadState* out, uint32_t count,
+                   uint32_t* returned);
+int32_t scePadGetControllerInformation(int32_t handle,
+                                       PsbPadControllerInfo* out);
+
+// ---- Network (v1.3 — GUEST_ABI §11: stubbed, logged, no connectivity) ------------
+#define PSB_NET_ERR_NOT_INITIALIZED (-0x4E01)
+#define PSB_NET_ERR_UNAVAILABLE     (-0x4E02)
+#define PSB_NET_ERR_INVALID_ARG     (-0x4E03)
+
+int32_t sceNetInit(uint64_t flags);
+int32_t sceNetTerm(void);
+int32_t sceNetSocket(const char* name, uint32_t domain, uint32_t type,
+                     uint32_t proto);
+int32_t sceNetConnect(int32_t socket, const void* addr, uint32_t addrLen);
+int32_t sceNetBind(int32_t socket, const void* addr, uint32_t addrLen);
+int32_t sceNetListen(int32_t socket, int32_t backlog);
+int32_t sceNetAccept(int32_t socket, void* addrOut, uint32_t* addrLenInOut);
+int32_t sceNetSend(int32_t socket, const void* buf, uint32_t len, int32_t flags);
+int32_t sceNetRecv(int32_t socket, void* buf, uint32_t len, int32_t flags);
+int32_t sceNetCloseSocket(int32_t socket);
+int32_t sceNetCtlInit(void);
+int32_t sceNetCtlTerm(void);
+int32_t sceNetCtlGetState(int32_t* stateOut);   // always reports disconnected
 
 #ifdef __cplusplus
 }

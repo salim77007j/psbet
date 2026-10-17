@@ -1,8 +1,14 @@
-# PSBET Guest ABI v1.2
+# PSBET Guest ABI v1.3
+
+> **v1.3 (Phase 4) additions:** the timing-counter API, AudioOut
+> (guest-side mixing), pad input (DualSense-style state + gyro), and the
+> stubbed network surface. All additions are additive; v1/v1.2 guests run
+> unchanged. See §6, §13, §14, §15 below.
 
 This document is the normative contract between a guest image and PSBET.
 Phase 3 (v1.2) extends v1 additively: memory model v2, GPU virtual memory,
-EQUEUE, virtualized I/O, raw-syscall containment. v1 guests run unchanged.
+EQUEUE, virtualized I/O, raw-syscall containment. Phase 4 (v1.3) adds audio,
+input, the timing counter pair and net stubs. v1 guests run unchanged.
 It is clean-room: the names are PS5-style for familiarity, the semantics
 below are PSBET's own definitions, and nothing here derives from Sony code.
 
@@ -105,15 +111,22 @@ sceGnmUnmapGpuAddress(gpuVa, len);
   physical pages into it, then reference the GPU-VA from PBFF v1.1 packets
   (opcode 6). GPU VAs are translated through real page tables per submit.
 
-## 6. Time
+## 6. Time (v1.3: counter pair)
 
 ```c
 sceKernelGetProcessTime();        // microseconds since process start
 sceKernelGetProcessTimeInTick();  // 1 tick = 1 nanosecond (PSBET definition)
+sceKernelGetProcessTimeCounter();          // counter ticks (1 tick = 1 ns)
+sceKernelGetProcessTimeCounterFrequency(); // fixed: 1,000,000,000 Hz
 sceKernelUsleep(us); sceKernelNanosleep(s, ns); sceKernelSleep(s);
 ```
 
-Clock is monotonic (`steady_clock`).
+The clock is **monotonic and drift-free by construction**: every value is
+derived from one origin sample taken at process start (`value = origin +
+elapsed`), with no accumulation and no re-derivation against a second clock.
+Counter frequency is a fixed constant, not a measured property. Sleeps are
+cooperative: they wake early (returning 0) when the process exit is requested
+or engine shutdown begins, so a sleeping guest can never stall teardown.
 
 ## 7. Synchronization
 
@@ -182,7 +195,71 @@ sceKernelWaitEqueue(eq, &eventOut, timeoutUs);     // 0 = unbounded; wakeable by
 sceKernelCancelEvent(eq, ident);
 ```
 
-## 12. Versioning
+## 13. Audio out (v1.3)
+
+PSBET mixes every open port into ONE fixed master stream: **48 kHz, stereo,
+s16**. Mixing happens on the runtime side (guest-side mixing semantics:
+ports submitting in the same frame window are summed into the same master
+frames; volume is applied per port per channel).
+
+```c
+sceAudioOutOpen(userId, portType, index, lenFrames, freq, format);
+sceAudioOutOutput(handle, ptr);   // submit exactly lenFrames of audio
+sceAudioOutSetVolume(handle, chBitmask, volumes);  // per-channel 0..32768
+sceAudioOutClose(handle);
+```
+
+* `userId` must be 0 (single-user); `portType`: 0 = Main, 1 = BGM, 2 = Voice;
+  `index` must be 0; `freq` must be 48000 (the master domain is fixed —
+  anything else is rejected, loudly, in the log); `format`: 0 = s16 mono,
+  1 = s16 stereo, 2 = f32 stereo.
+* Handles are 1-based; every documented failure returns -1 and logs why.
+* Consumption model: without pacing, submits are consumed immediately.
+  With a target FPS authorized (`psbet run --fps 60`), each presented frame
+  authorizes exactly (48000/fps) master frames — audio consumption is glued
+  to video pacing. A submit while the unplayed queue is at/over the latency
+  cap blocks briefly (guest-cooperative); the measured queue depth is
+  reported in the run summary (`max latency`).
+* Dropped samples are an invariant: 0 (a port submitting late is the only
+  drop path and is counted, never silent).
+
+## 14. Pad / input (v1.3)
+
+```c
+scePadOpen(userId, type, index, param);        // all-zero for pad 1
+scePadReadState(handle, &state);               // current state snapshot
+scePadRead(handle, states, count, &returned);  // 1 snapshot (current)
+scePadGetControllerInformation(handle, &info); // touchpad + connection
+```
+
+* `PsbPadState`: buttons (PSB_PAD_BTN_*), sticks/ly/rx/ry 0..255
+  (center 128), analog l2/r2 0..255, accelerometer in g, gyroscope in deg/s,
+  `connected`, and `timestampUs` — the guest time at which this state became
+  valid. **End-to-end input latency = observation time − timestampUs**;
+  at 60 FPS pacing it is bounded by one frame interval plus poll offset
+  (measured by the suite: < 25 ms).
+* Without a driver (`null`), every pad reports `connected = 0` — a correct,
+  testable state. With `--pad-script FILE`, a deterministic time-keyed
+  driver feeds states (CI + reproducible bug reports). With SDL3 built in,
+  real game controllers (DualSense included) map through SDL's gamepad API,
+  gyro included.
+
+## 15. Network (v1.3: stubbed, logged, no connectivity)
+
+```c
+sceNetInit(0);              // -> PSB_NET_ERR_UNAVAILABLE  (-0x4E02)
+sceNetSocket(...);          // -> PSB_NET_ERR_UNAVAILABLE
+sceNetConnect/Bind/Listen/Accept/Send/Recv/CloseSocket(...);
+                            // -> PSB_NET_ERR_NOT_INITIALIZED (-0x4E01)
+sceNetCtlGetState(&state);  // returns 0, state = 0 (disconnected, always)
+```
+
+PSBET grants guests NO network access. Every call is logged (rate-limited:
+first 8 calls in full, then aggregated) and refused with the documented
+code. Nothing opens sockets or touches the host network stack — verifiable
+by audit. Guests should gate online features on `sceNetCtlGetState`.
+
+## 16. Versioning
 
 `psbGetRuntimeVersion()` packs `major.minor.patch`. ABI v1 will not break
 backward compatibility; additions are additive. Compile against

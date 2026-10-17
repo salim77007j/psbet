@@ -14,6 +14,8 @@
 
 namespace psb {
 class GuestMemory;
+namespace av { class FramePacer; class IPresenter; }
+namespace audio { class Mixer; }
 }
 
 namespace psb::gpu {
@@ -49,6 +51,12 @@ public:
     // Phase-3 GPU VM: the address space used to translate GPU-VA draws.
     void setAddressSpace(GuestMemory* space) { addressSpace_ = space; }
 
+    // Phase-4 frame clock: pacer (target-FPS authorization / vsync) and the
+    // audio mixer (frame-clock audio pulls). Null = free run, no audio pull.
+    void setFrameClock(av::FramePacer* pacer, audio::Mixer* mixer);
+    // Phase-4 presentation sink (offscreen by default).
+    void setPresenter(av::IPresenter* presenter);
+
     // Called once per completed guest submit: bumps the frame counter, runs
     // the frame hook, and enforces the safety frame limit (requests guest
     // exit(124) when hit).
@@ -65,6 +73,9 @@ private:
     std::unique_ptr<IRasterBackend> backend_;
     const char* backendName_ = "software";
     GuestMemory* addressSpace_ = nullptr;   // GPU VA translation (Phase 3)
+    av::FramePacer* pacer_ = nullptr;       // Phase 4 frame clock
+    audio::Mixer*   mixer_ = nullptr;
+    av::IPresenter* presenter_ = nullptr;
 
     u64  frames_ = 0;
     u64  maxFrames_ = ~0ull;

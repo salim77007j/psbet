@@ -29,7 +29,7 @@ constexpr u64 GiB = MiB * 1024ull;
 
 // Engine version (semantic): major.minor.patch
 constexpr u32 kVersionMajor = 0;
-constexpr u32 kVersionMinor = 3;
+constexpr u32 kVersionMinor = 4;
 constexpr u32 kVersionPatch = 0;
 
 // ---------------------------------------------------------------------------
