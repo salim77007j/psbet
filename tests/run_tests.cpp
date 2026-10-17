@@ -697,6 +697,10 @@ bool test_guest_cube() {
     return true;
 }
 
+#endif // PSBET_RUN_GUEST_TESTS — guest-test definitions pause here; the
+       // Phase-4 unit tests below are portable (all platforms) and are
+       // called unconditionally from main().
+
 // ---------------------------------------------------------------------------
 // Phase-4 unit tests: timing, audio, pad, net.
 // ---------------------------------------------------------------------------
@@ -998,6 +1002,7 @@ bool test_guest_equeue() {
     return true;
 }
 
+#ifdef PSBET_RUN_GUEST_TESTS
 bool test_guest_fs_demo() {
     // Container image for app0 (PSA built here, verified by the guest).
     std::filesystem::create_directories("fsapp/docs");
