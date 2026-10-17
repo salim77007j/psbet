@@ -26,3 +26,12 @@ screenshots-local/
 # Do NOT ignore docs/screenshots (committed evidence of validation runs)
 !docs/screenshots/
 !docs/screenshots/*.png
+
+# Suite/demo run byproducts (created when tests run from the repo root)
+/test_pad_script.txt
+/pad.txt
+/fsapp.psa
+/fsapp/
+/tone.wav
+/*.wav
+/out.wav
