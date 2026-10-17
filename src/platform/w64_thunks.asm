@@ -341,5 +341,23 @@ thunk5 psbTWinProbeCall5,           psbXProbeCall5
 thunk6 psbTWinProbeCall6,           psbXProbeCall6
 thunk2 psbTWinProbePtr2,            psbXProbePtr2
 
+; ---------------------------------------------------------------------------
+; Host -> guest ABI bridge (the reverse direction of the thunks above).
+; MSVC host code launching a guest worker thread has (arglen, argp, entry) in
+; Win64 regs (RCX, RDX, R8); the GCC-compiled guest entry expects SysV
+; (RDI = arglen, RSI = argp). Calling the guest directly from host code passes
+; garbage arguments (the hello.exe ACCESS_VIOLATION: its worker dereferenced
+; the garbage argp). The bridge shuffles and calls; the guest's int32 return
+; arrives in EAX, which is the return register in both ABIs.
+; ---------------------------------------------------------------------------
+psbTWinGuestThreadEntry PROC
+    mov     rdi, rcx              ; SysV arg1 = arglen
+    mov     rsi, rdx              ; SysV arg2 = argp
+    sub     rsp, 28h              ; shadow + 16-alignment (entry RSP%16 = 8)
+    call    r8                    ; guest entry (runtime pointer)
+    add     rsp, 28h
+    ret
+psbTWinGuestThreadEntry ENDP
+
 _TEXT ENDS
 END

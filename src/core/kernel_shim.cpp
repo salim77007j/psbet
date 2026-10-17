@@ -590,11 +590,24 @@ int32_t sceKernelStartThread(int32_t tid, size_t arglen, void* argp) {
         installThreadTls();
         if (setjmp(g_threadExitEnv.buf) == 0) {
             g_threadExitEnvValid = true;
+#if defined(_WIN32)
+            // Host->guest ABI bridge: the MSVC-compiled lambda cannot call
+            // the GCC-compiled guest entry directly (Win64 RCX/RDX vs SysV
+            // RDI/RSI) — the bridge shuffles; the guest's int32 return
+            // arrives in EAX, the return register of both ABIs.
+            g_pendingRetVal = psbTWinGuestThreadEntry(
+                raw->argBuf.size(),
+                raw->argBuf.empty()
+                    ? nullptr
+                    : static_cast<void*>(raw->argBuf.data()),
+                raw->entry);
+#else
             PsbThreadEntry fn = reinterpret_cast<PsbThreadEntry>(raw->entry);
             g_pendingRetVal = fn(raw->argBuf.size(),
                                  raw->argBuf.empty()
                                      ? nullptr
                                      : static_cast<void*>(raw->argBuf.data()));
+#endif
         }
         // Reached via sceKernelExitThread longjmp or natural return.
         g_threadExitEnvValid = false;
@@ -978,7 +991,10 @@ int32_t psbProbePtr2(void* out, uint64_t val) {
 // Guests call these through SysV->Win64 thunks (w64_thunks.asm): the thunk
 // shuffles SysV registers (RDI,RSI,RDX,RCX...) into Win64 order (RCX,RDX,R8,
 // R9) and reserves shadow space. Forwarders only — all logic stays here.
+// psbTWinGuestThreadEntry is the REVERSE bridge: host->guest worker launch.
 #if defined(_WIN32)
+extern "C" int32_t psbTWinGuestThreadEntry(size_t arglen, void* argp,
+                                           void* entry);
 // Defined later in this file (PSBET runtime section).
 void*    psbTlsGetAddr(PsbTlsIndex* idx);
 void     psbCxaFinalize(void* d);
