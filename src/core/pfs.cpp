@@ -268,7 +268,10 @@ bool PsbArchive::packDirectory(const std::string& hostDir,
     // Second pass: file contents.
     for (const Item& it : items) {
         if (it.dir) continue;
-        std::FILE* f = std::fopen((fs::path(hostDir) / it.rel).c_str(), "rb");
+        // path::c_str() is wchar_t on Windows — convert to a narrow string
+        // explicitly (portable across MSVC / GCC).
+        const std::string srcPath = (fs::path(hostDir) / it.rel).string();
+        std::FILE* f = std::fopen(srcPath.c_str(), "rb");
         if (!f) {
             LOG_ERROR("PFS: pack: cannot read %s", it.rel.c_str());
             return false;

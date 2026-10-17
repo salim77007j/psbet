@@ -154,6 +154,11 @@ const char* describe(Mode mode) {
 
 #else // non-Linux / non-x86-64
 
+// NOTE: the namespace opens inside the Linux branch above, so this fallback
+// branch must open its own — otherwise these definitions land at global
+// scope where psb::syscall_trap::Mode is unreachable (MSVC build breaker).
+namespace psb::syscall_trap {
+
 bool available() { return false; }
 
 bool installOnCurrentThread(Mode mode) {
