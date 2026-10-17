@@ -169,7 +169,9 @@ GuestRunResult runGuestEntry(const LoadedModule& mod, kernel::KernelState& kerne
         // Route through the ABI bridge: a direct MSVC->GCC call would leave
         // the guest's clobbered RDI/RSI (SysV-volatile) visible to MSVC code
         // (Win64-nonvolatile). Guest main is void() — args ignored.
-        psbTWinGuestThreadEntry(0, nullptr, mod.entry);
+        psbTWinGuestThreadEntry(0, nullptr,
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(mod.entry)));
 #else
         using GuestEntry = void (*)();
         reinterpret_cast<GuestEntry>(mod.entry)();
