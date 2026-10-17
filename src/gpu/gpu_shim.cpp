@@ -253,12 +253,30 @@ extern "C" int32_t sceGnmUnmapGpuAddress(uint64_t gpuVa, uint64_t len) {
 }
 
 namespace {
+#if defined(_WIN32)
+// Guests must reach these through the MASM thunks (w64_thunks.asm) — a
+// direct MSVC-compiled binding receives SysV register arguments (audio_tone's
+// GNM submit failed silently: count read from RCX instead of RDI).
+extern "C" {
+void psbTWinGnmSubmit(void);
+void psbTWinGnmReserveGpuVa(void);
+void psbTWinGnmMapGpuVa(void);
+void psbTWinGnmUnmapGpuVa(void);
+}
+const struct { const char* name; void* fn; } kGpuExports[] = {
+    {"sceGnmSubmitCommandBuffers", (void*)&psbTWinGnmSubmit},
+    {"sceGnmReserveGpuAddress",    (void*)&psbTWinGnmReserveGpuVa},
+    {"sceGnmMapGpuAddress",        (void*)&psbTWinGnmMapGpuVa},
+    {"sceGnmUnmapGpuAddress",      (void*)&psbTWinGnmUnmapGpuVa},
+};
+#else
 const struct { const char* name; void* fn; } kGpuExports[] = {
     {"sceGnmSubmitCommandBuffers", (void*)&sceGnmSubmitCommandBuffers},
     {"sceGnmReserveGpuAddress",    (void*)&sceGnmReserveGpuAddress},
     {"sceGnmMapGpuAddress",        (void*)&sceGnmMapGpuAddress},
     {"sceGnmUnmapGpuAddress",      (void*)&sceGnmUnmapGpuAddress},
 };
+#endif
 } // namespace
 
 void* findGpuExport(const char* name) {
