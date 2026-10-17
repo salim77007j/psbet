@@ -1123,10 +1123,10 @@ bool test_guest_audio_tone() {
     };
     bool mixOk = true;
     for (psb::u32 k = 0; k < 800 && mixOk; ++k) {
-        const float a = 0.5f * std::sinf(660.f * 2.f * 3.14159265f *
-                                         static_cast<float>(k) / 48000.f);
-        const float b = 0.5f * std::sinf(220.f * 2.f * 3.14159265f *
-                                         static_cast<float>(k) / 48000.f);
+        const float a = 0.5f * std::sin(660.f * 2.f * 3.14159265f *
+                                        static_cast<float>(k) / 48000.f);
+        const float b = 0.5f * std::sin(220.f * 2.f * 3.14159265f *
+                                        static_cast<float>(k) / 48000.f);
         const psb::i32 la = static_cast<psb::i32>(a * 32767.f);
         const psb::i32 lb = static_cast<psb::i32>(b * 32767.f);
         const psb::i32 vMax = static_cast<psb::i32>(psb::audio::kVolMax);
