@@ -144,14 +144,21 @@ void PadService::recordLatency(const PadSnapshot& snap, u64 nowUs) {
         maxLatencyUs_ = nowUs - snap.dueUs;
 }
 
-void PadService::poll() {
-    std::lock_guard<std::mutex> lk(mtx_);
+// Shared refresh under mtx_. Called from the engine frame path (GPU submit)
+// AND from the guest read paths — input freshness must NOT depend on GPU
+// render time (a slow backend must not delay when guests observe input;
+// real hardware samples input independent of the GPU pipeline).
+void PadService::refreshLocked(u64 now) {
     ++driverPolls_;
     if (!driver_) return;
-    const u64 now = time::TimeDomain::get().us();
     driver_->poll(snaps_, now);
     for (u32 i = 0; i < kMaxHandles; ++i)
         if (handleUsed_[i]) recordLatency(snaps_[i], now);
+}
+
+void PadService::poll() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    refreshLocked(time::TimeDomain::get().us());
 }
 
 i32 PadService::open(u32 userId, i32 type, i32 index, const void* param) {
@@ -188,6 +195,9 @@ i32 PadService::readState(i32 handle, PadState* out) {
     if (handle < 1 || handle > static_cast<i32>(kMaxHandles) || !out) return -1;
     std::lock_guard<std::mutex> lk(mtx_);
     if (!handleUsed_[handle - 1]) return -1;
+    // On-demand refresh: the served state is sampled NOW, not at the last
+    // GPU submit — decouples input observation latency from render time.
+    refreshLocked(time::TimeDomain::get().us());
     *out = snaps_[handle - 1].state;
     return 0;
 }
@@ -197,6 +207,7 @@ i32 PadService::read(i32 handle, PadState* out, u32 count, u32* returned) {
         return -1;
     std::lock_guard<std::mutex> lk(mtx_);
     if (!handleUsed_[handle - 1]) return -1;
+    refreshLocked(time::TimeDomain::get().us());   // same freshness contract
     if (returned) *returned = snaps_[handle - 1].state.connected ? 1u : 0u;
     if (snaps_[handle - 1].state.connected) out[0] = snaps_[handle - 1].state;
     return 0;

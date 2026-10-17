@@ -93,12 +93,13 @@ stubs with logging, `sceKernelGetProcessTimeCounter[Frequency]`,
       invariant, fuzz-locked (Phase F) and measured on the paced tone run
       (24,000 frames mixed, 0 dropped, max queue latency 16 ms < 40 ms)
 - [x] Input: end-to-end latency < 25 ms at 60 FPS pacing — measured inside
-      the guest (17.9 ms median observed) and asserted end-to-end by the
-      suite. CI-hardened to a runner-structural form after a shared-runner
-      flake: median of 5 presses against max(25 ms, achieved frame
-      interval + 8.3 ms poll allowance) — exactly 25 ms on a host holding
-      the 60 FPS cadence, scaled to what slower runners achieve — with a
-      per-press stall ceiling of max(150 ms, 3× frame)
+      the guest and asserted end-to-end by the suite. A post-merge CI
+      failure exposed a real defect (pad refresh coupled to the GPU submit
+      path) whose fix dropped measured median latency from 17.9 ms to
+      1.29 ms (13×, now independent of GPU/backend speed); the gate is
+      runner-structural: median of 5 presses against max(25 ms, achieved
+      frame interval + 8.3 ms poll allowance), per-press stall ceiling
+      max(150 ms, 3× frame) — see PHASE_4_REPORT §5.1
 - [x] Guest timing APIs monotonic and drift-free over 24 h simulated soak —
       exact-value assertions every 100 ms of guest time, concurrent-reader
       monotonicity under threads

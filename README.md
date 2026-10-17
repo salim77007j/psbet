@@ -9,8 +9,8 @@ PCs running Linux and Windows.
 > simulated soak), **AudioOut** (guest-side mixing into a fixed 48 kHz
 > stereo master, WAV-dump + SDL3 backends, zero-drop invariant), **pad
 > input** (DualSense-style state + gyroscope; deterministic scripted
-> driver and SDL3 gamepads; measured < 25 ms end-to-end latency at 60 FPS
-> pacing), **target-FPS authorization** with frame-clock audio
+> driver and SDL3 gamepads; measured 1.3 ms median end-to-end input latency
+> (contract < 25 ms at 60 FPS, independent of GPU speed)), **target-FPS authorization** with frame-clock audio
 > consumption, a vsync present-queue model, the presentation layer
 > (offscreen or SDL3 window), and logged, fully-stubbed network. See
 > `docs/PHASE_4_REPORT.md`.

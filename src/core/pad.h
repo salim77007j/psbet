@@ -169,6 +169,9 @@ public:
 private:
     PadService() = default;
     void recordLatency(const PadSnapshot& snap, u64 nowUs);
+    // Shared driver refresh under mtx_ — called from the engine frame path
+    // and from the guest read paths (freshness independent of GPU cadence).
+    void refreshLocked(u64 now);
 
     mutable std::mutex mtx_;
     std::unique_ptr<IPadDriver> driver_;

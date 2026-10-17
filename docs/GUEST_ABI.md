@@ -236,12 +236,14 @@ scePadGetControllerInformation(handle, &info); // touchpad + connection
   (center 128), analog l2/r2 0..255, accelerometer in g, gyroscope in deg/s,
   `connected`, and `timestampUs` — the guest time at which this state became
   valid. **End-to-end input latency = observation time − timestampUs**;
-  at 60 FPS pacing it is bounded by one frame interval plus poll offset.
-  The scripted-driver acceptance (`input_demo`) is runner-structural:
+  the state is refreshed at the read call itself, so a poll observes any
+  already-valid state at its very next poll — measured median 1.3 ms,
+  independent of GPU/backend speed (PHASE_4_REPORT §5.1). The
+  scripted-driver acceptance (`input_demo`) is runner-structural:
   the MEDIAN press latency must be < max(25 ms, achieved frame interval
   + 8.3 ms poll allowance) — exactly the 25 ms product acceptance on a
-  host holding the 60 FPS cadence, scaled to the cadence slower hosts
-  actually achieve — and every press must be < max(150 ms, 3× frame).
+  host holding the 60 FPS cadence — and every press must be
+  < max(150 ms, 3× frame).
 * Without a driver (`null`), every pad reports `connected = 0` — a correct,
   testable state. With `--pad-script FILE`, a deterministic time-keyed
   driver feeds states (CI + reproducible bug reports). With SDL3 built in,
