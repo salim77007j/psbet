@@ -75,6 +75,9 @@ public:
     bool pipelined() const { return pipelined_; }
     // Host color buffer consumed this frame (window present / screenshots)?
     // Hardware backends skip the per-frame readback when it is not.
+    // Default TRUE (old semantics: always read back) — direct Device users
+    // (pixel-compare oracle, self-tests) depend on the copy. The Emulator
+    // sets it false only when nothing consumes the buffer this run.
     void setReadbackHint(bool on) { readbackHint_ = on; }
     // Drain + stop both queues (idempotent). The Emulator calls this before
     // reading final stats; ~Device calls it again harmlessly.
@@ -126,7 +129,7 @@ private:
     u64  maxFrames_ = ~0ull;
     std::atomic<bool> frameLimitHit_{false};   // worker-set; guest acts on it
     bool pipelined_ = false;
-    bool readbackHint_ = false;
+    bool readbackHint_ = true;
     FrameHook hook_;
 
 public:
