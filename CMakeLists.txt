@@ -133,7 +133,10 @@ if(NOT MSVC AND NOT WIN32)
   # Guests are the "console side": they must never inherit host sanitizer
   # flags — ASan-instrumented guest code has no runtime to link against and
   # will crash the moment it executes. Force-clean compile and link.
-  set(GUEST_CFLAGS -shared -fPIC -nostartfiles -O2 -Werror
+  # -U_FORTIFY_SOURCE: distro GCCs fortify constant-size memcpy into
+  # __memcpy_chk, which Windows cannot resolve (no dlsym) — guests are
+  # freestanding images, never fortified (Phase-5 Windows gate lesson).
+  set(GUEST_CFLAGS -shared -fPIC -nostartfiles -O2 -Werror -U_FORTIFY_SOURCE
       -fno-sanitize=address -fno-sanitize=undefined
       -fno-stack-protector)
   set(GUEST_LDFLAGS -shared -nostartfiles -Wl,-e,psb_entry -Wl,--build-id=none
