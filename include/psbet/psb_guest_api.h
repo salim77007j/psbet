@@ -129,10 +129,25 @@ int32_t sceKernelFstat(int32_t fd, PsbStat* out);
 // ---- GPU submission -----------------------------------------------------------------
 // Submits display command buffers (PBFF v1, see gpu/cmd_stream.h in the
 // runtime tree). Count/arrays mirror the Orbis-style submit shape.
+// v1.4: submissions are ASYNCHRONOUS (console semantics) — the call returns
+// when the buffers are accepted by the GPU queue, not when they complete.
+// The host reads GPU-visible memory at execution time; guests that mutate
+// submitted data must multi-buffer or fence. See docs/GUEST_ABI.md §16.
 int32_t sceGnmSubmitCommandBuffers(uint32_t count, void** dcbAddrs,
                                    uint32_t* dcbSizesInBytes,
                                    void** ccbAddrs, uint32_t* ccbSizesInBytes,
                                    uint32_t flags);
+
+// v1.4 — compute queue (docs/GUEST_ABI.md §16).
+// sceGnmSubmitCompute submits command buffers to the compute queue (data-
+// parallel work such as CmdFillMemory). Compute submits never present
+// frames. sceGnmWaitQueueIdle blocks (guest-cooperative, exit-aware) until
+// the selected queues drain: bit0 = graphics, bit1 = compute (3 = both).
+#define PSB_QUEUE_GRAPHICS 0x1u
+#define PSB_QUEUE_COMPUTE  0x2u
+int32_t sceGnmSubmitCompute(uint32_t count, void** ccbAddrs,
+                            uint32_t* ccbSizesInBytes);
+int32_t sceGnmWaitQueueIdle(uint32_t queueMask);
 
 // ---- Audio out (v1.3 — GUEST_ABI §9) ---------------------------------------------
 // PSBET mixes every open port into one fixed 48 kHz stereo master stream

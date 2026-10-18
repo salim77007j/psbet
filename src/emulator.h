@@ -26,6 +26,9 @@ struct EmuOptions {
     std::string audioDump;           // WAV path -> mixed-master dump backend
     std::string padScript;           // scripted pad events (time-keyed)
     std::string window = "off";      // on -> SDL3 presentation window (opt.)
+    // Phase 5 — performance:
+    bool        gpuSync = false;     // --gpu-sync: disable pipelined submits
+    u32         gpuThreads = 0;      // --gpu-threads N: raster band workers (0=auto)
 };
 
 struct EmuStats {
@@ -56,6 +59,17 @@ struct EmuStats {
     u32    vsyncWaits = 0;
     u64    netStubCalls = 0;
     std::string presenterUsed;       // offscreen | sdl3-window
+    // Phase-5 GPU queue / raster accounting:
+    bool   gpuPipelined = false;     // submit path mode for this run
+    u64    gpuEnqueued = 0;          // graphics CBs accepted by the queue
+    u64    gpuCompleted = 0;         // graphics CBs executed by the worker
+    u64    gpuBackpressureWaits = 0; // guest submits blocked by the cap
+    u32    gpuMaxInFlight = 0;       // deepest observed work-ahead
+    u32    gpuMaxInFlightCap = 0;    // configured bound
+    u64    gpuExecuteUs = 0;         // worker execution time (graphics)
+    u64    gpuComputeSubmits = 0;    // compute-queue CBs
+    u32    rasterThreads = 0;        // band workers used by the software backend
+    bool   rasterSimd = false;       // AVX fast path active
 };
 
 class Emulator {

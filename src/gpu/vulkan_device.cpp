@@ -290,7 +290,7 @@ struct VulkanDevice::Impl {
     VkPipeline getPipeline(bool depthEnable, DepthFunc df, CullMode cm);
     bool beginFrame();
     void beginPass(VkCommandBuffer cb);
-    void endFrame();
+    void endFrame(bool readback);
     bool submitAndWait(VkCommandBuffer cb);
     void destroy();
 };
@@ -706,38 +706,46 @@ void VulkanDevice::Impl::beginPass(VkCommandBuffer cb) {
     VK_TRACE("beginPass: done");
 }
 
-void VulkanDevice::Impl::endFrame() {
+void VulkanDevice::Impl::endFrame(bool readback) {
     if (!cmdbufOpen) return;
     if (passBegun) {
         VK_TRACE("endFrame: end renderpass");
         g_vk.vkCmdEndRenderPass(cmd);
     }
-    VK_TRACE("endFrame: barrier");
 
-    // Barrier: color image TRANSFER_SRC_OPTIMAL (renderpass finalLayout) —
-    // readback image UNDEFINED -> GENERAL for the copy destination.
-    VkImageMemoryBarrier rb{};
-    rb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    rb.srcAccessMask = 0;
-    rb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    rb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    rb.image = readbackImage;
-    rb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // Phase-5 lazy readback: when the host color buffer is not consumed
+    // this frame (no screenshots, offscreen presentation), skip the copy
+    // and the host memcpy — the renderpass itself still runs and the color
+    // image still lands in TRANSFER_SRC_OPTIMAL (its finalLayout), so the
+    // next frame's UNDEFINED->attachment transition is unaffected.
+    if (readback) {
+        VK_TRACE("endFrame: barrier");
 
-    g_vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                              0, nullptr, 0, nullptr, 1, &rb);
+        // Barrier: color image TRANSFER_SRC_OPTIMAL (renderpass finalLayout) —
+        // readback image UNDEFINED -> GENERAL for the copy destination.
+        VkImageMemoryBarrier rb{};
+        rb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        rb.srcAccessMask = 0;
+        rb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        rb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.image = readbackImage;
+        rb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    VK_TRACE("endFrame: copy");
-    VkImageCopy region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.extent = {width, height, 1};
-    g_vk.vkCmdCopyImage(cmd, colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        readbackImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        g_vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &rb);
+
+        VK_TRACE("endFrame: copy");
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {width, height, 1};
+        g_vk.vkCmdCopyImage(cmd, colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            readbackImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
 
     VK_TRACE("endFrame: end cmd");
     if (g_vk.vkEndCommandBuffer(cmd) != VK_SUCCESS) {
@@ -750,7 +758,7 @@ void VulkanDevice::Impl::endFrame() {
     passBegun = false;
 
     if (!submitAndWait(cmd)) failed = true;
-    if (!failed && readbackMapped && colorOut)
+    if (readback && !failed && readbackMapped && colorOut)
         std::memcpy(colorOut, readbackMapped, static_cast<size_t>(width) * height * 4);
 }
 
@@ -871,10 +879,10 @@ void VulkanDevice::drawTriangles(const GpuVertex* v, u32 count) {
     VK_TRACE("draw: done");
 }
 
-void VulkanDevice::frameEnd() {
+void VulkanDevice::frameEnd(bool readback) {
     Impl* p = impl_;
     if (p->failed) return;
-    p->endFrame(); // submits, waits, reads color back into colorOut
+    p->endFrame(readback); // submits, waits; reads color back only when asked
     if (p->failed) LOG_ERROR("Vulkan: frame submission failed — backend disabled");
 }
 
@@ -947,7 +955,7 @@ bool VulkanDevice::selfTestImpl() {
         {{ 0.0f,  0.5f, 0.5f, 1.f}, {0.f, 0.f, 1.f, 1.f}},
     };
     backend->drawTriangles(tri, 3);
-    backend->frameEnd();
+    backend->frameEnd(true);
     backend.reset();
 
     // Expect: black background + a few hundred non-black (triangle) pixels.

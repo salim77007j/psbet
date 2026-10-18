@@ -4,6 +4,17 @@
 //  plus a float32 depth buffer. Zero dependencies, deterministic output,
 //  runs headless (CI-friendly) — the correctness oracle for the Vulkan
 //  backend and the permanent fallback device.
+//
+//  Phase 5 performance model:
+//    * Row-band parallel execution — a triangle's bounding box is split
+//      into disjoint row bands executed on a persistent worker pool.
+//      Bands own disjoint pixel sets, so output is BYTE-IDENTICAL to the
+//      single-thread path for any thread count (locked by test).
+//    * Optional AVX2 fast path (x86-64, GCC/Clang): the same IEEE double
+//      arithmetic, four pixels per vector, explicit intrinsics (no FMA
+//      contraction) — BYTE-IDENTICAL to the scalar path (locked by test).
+//    * The scalar double path remains the reference; SIMD/tiles are pure
+//      scheduling. Runtime dispatch + setters for tests and tuning.
 // ============================================================================
 #pragma once
 
@@ -31,7 +42,11 @@ public:
     // Called once after each command-buffer execution (one guest submit = one
     // frame). Hardware backends flush/submit/readback here; the software
     // rasterizer needs nothing. Default: no-op.
-    virtual void frameEnd() { (void)0; }
+    // Phase 5: `readback` tells hardware backends whether the host color
+    // buffer is actually consumed this frame (screenshots / window present).
+    // Skipping the readback on unconsumed frames removes a full framebuffer
+    // copy per submit. The software backend ignores it.
+    virtual void frameEnd(bool readback) { (void)readback; }
 };
 
 class Rasterizer final : public IRasterBackend {
@@ -44,6 +59,25 @@ public:
     void setCullMode(CullMode mode) override;
     void clear(float r, float g, float b, float a) override;
     void drawTriangles(const GpuVertex* v, u32 count) override;
+
+    // ---- Phase 5 tuning (process-global; used by tests + the bench tool) --
+    // Band worker count (0 = auto: min(hw_threads - 1, 8), floor 1). The
+    // PSBET_RASTER_THREADS env var overrides the auto default at first use.
+    static void setBandThreads(u32 n);
+    static u32  bandThreads();
+    // AVX fast-path toggle (default: on when the host CPU supports AVX2 and
+    // the compiler emitted the path). Byte-identical output either way.
+    static void setSimdEnabled(bool on);
+    static bool simdEnabled();
+    static bool simdCompiled();          // true when the AVX path exists
+    static bool hostHasAvx2();           // CPUID-based runtime check
+
+    // Band-core accessors (internal use; exposed for testability).
+    u32    width()  const { return width_; }
+    u32    height() const { return height_; }
+    const float* viewport() const { return &vpX_; }
+    u8*    colorData() const { return color_; }
+    float* depthData() const { return depth_; }
 
 private:
     u8*    color_;

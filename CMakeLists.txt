@@ -58,6 +58,7 @@ add_library(psbet_core STATIC
   src/gpu/rdna.cpp
   src/gpu/rdna_spirv.cpp
   src/gpu/rasterizer.cpp
+  src/gpu/gpu_queue.cpp
   src/gpu/vulkan_device.cpp
   src/gpu/gpu_shim.cpp
   src/emulator.cpp
@@ -228,6 +229,23 @@ if(NOT MSVC AND NOT WIN32)
   target_link_options(hb_net_probe PRIVATE ${GUEST_LDFLAGS})
   set_target_properties(hb_net_probe PROPERTIES
     OUTPUT_NAME "net_probe" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  # Phase-5 homebrew: async compute queue + multithreaded submitters.
+  add_library(hb_compute_fill SHARED tests/homebrew/compute_fill.c)
+  target_include_directories(hb_compute_fill PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_compute_fill PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_compute_fill PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_compute_fill PROPERTIES
+    OUTPUT_NAME "compute_fill" PREFIX "" SUFFIX ".elf"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  add_library(hb_mt_submit SHARED tests/homebrew/mt_submit.c)
+  target_include_directories(hb_mt_submit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(hb_mt_submit PRIVATE ${GUEST_CFLAGS})
+  target_link_options(hb_mt_submit PRIVATE ${GUEST_LDFLAGS})
+  set_target_properties(hb_mt_submit PROPERTIES
+    OUTPUT_NAME "mt_submit" PREFIX "" SUFFIX ".elf"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()
 

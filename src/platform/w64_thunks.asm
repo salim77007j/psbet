@@ -53,6 +53,8 @@ EXTERN psbXCxaFinalize:PROC
 EXTERN psbXGetRuntimeVersion:PROC
 EXTERN psbXGetRuntimeName:PROC
 EXTERN psbXGnmSubmitCommandBuffers:PROC
+EXTERN psbXGnmSubmitCompute:PROC
+EXTERN psbXGnmWaitQueueIdle:PROC
 EXTERN psbXStackChkFail:PROC
 EXTERN psbXProbeCall1:PROC
 EXTERN psbXProbeCall2:PROC
@@ -294,6 +296,8 @@ thunk1 psbTWinCxaFinalize,          psbXCxaFinalize
 thunk0 psbTWinGetRuntimeVersion,    psbXGetRuntimeVersion
 thunk0 psbTWinGetRuntimeName,       psbXGetRuntimeName
 thunk6 psbTWinGnmSubmit,            psbXGnmSubmitCommandBuffers   ; 6 args
+thunk3 psbTWinGnmSubmitCompute,     psbXGnmSubmitCompute          ; 3 args (Phase 5)
+thunk1 psbTWinGnmWaitQueueIdle,     psbXGnmWaitQueueIdle          ; 1 arg  (Phase 5)
 thunk4 psbTWinGnmReserveGpuVa,      psbXGnmReserveGpuAddress      ; 4 args
 thunk4 psbTWinGnmMapGpuVa,          psbXGnmMapGpuAddress          ; 4 args
 thunk2 psbTWinGnmUnmapGpuVa,        psbXGnmUnmapGpuAddress        ; 2 args

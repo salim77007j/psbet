@@ -265,7 +265,48 @@ first 8 calls in full, then aggregated) and refused with the documented
 code. Nothing opens sockets or touches the host network stack — verifiable
 by audit. Guests should gate online features on `sceNetCtlGetState`.
 
-## 16. Versioning
+## 16. Asynchronous GPU queues (v1.4 — Phase 5)
+
+Submissions are **asynchronous with console semantics**:
+
+```c
+sceGnmSubmitCommandBuffers(...);  // returns when ACCEPTED, not executed
+sceGnmSubmitCompute(count, ccbAddrs, ccbSizesInBytes);   // compute queue
+sceGnmWaitQueueIdle(PSB_QUEUE_COMPUTE);                  // cross-queue fence
+```
+
+1. **Execution model.** A submit snapshots the command buffer into a bounded
+   FIFO (in-flight cap 2) and returns; a dedicated GPU worker executes
+   buffers one at a time in submit order. Results are identical to the
+   synchronous path — only scheduling changes. `--gpu-sync` restores inline
+   execution (debugging / A-B).
+2. **Data ownership.** The device reads GPU-visible memory (inline payloads,
+   GPU-VA vertices, fill regions) at EXECUTION time. A guest that rewrites
+   submitted data must multi-buffer (one slot per in-flight frame: the
+   in-flight cap is 2, so 3 slots are provably safe — see `cube_vm.c`) or
+   fence with `sceGnmWaitQueueIdle`.
+3. **Compute queue.** `sceGnmSubmitCompute` routes to a second, independent
+   queue. The Phase-5 compute surface is `CmdFillMemory` (op 7): a
+   data-parallel fill of a GPU-VA region (u32 pattern, len multiple of 4,
+   <= 64 MiB). Compute submits are not display frames (no present, no
+   frame counting). Real compute-shader translation is future roadmap work.
+4. **Cross-queue ordering.** The two queues are independent. Graphics work
+   that consumes compute results MUST fence first:
+   `sceGnmWaitQueueIdle(PSB_QUEUE_COMPUTE)`. Mask bits: 1 = graphics,
+   2 = compute, 3 = both. The wait is guest-cooperative and exit-aware.
+5. **Frame-limit interplay.** `--frames N` still requests exit(124) after
+   the Nth completed frame; with pipelining the guest may be up to 2 frames
+   ahead when the flag fires, so the final count lands in [N, N+2]. A guest
+   that exits naturally at/after the limit keeps its own exit code.
+6. **Backpressure.** A submit blocks (guest-cooperative, exit-aware) while
+   2 submissions are queued/executing. Blocked submits wake on process exit
+   and on the frame limit — teardown can never hang on a submitter.
+
+Windows: both new imports ship with MASM thunks (`thunk3`/`thunk1`) and are
+machine-audited by `ci/audit_thunks.py`; `compute_fill` and `mt_submit` are
+hard CI gates on both platforms.
+
+## 17. Versioning
 
 `psbGetRuntimeVersion()` packs `major.minor.patch`. ABI v1 will not break
 backward compatibility; additions are additive. Compile against

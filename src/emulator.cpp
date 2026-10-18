@@ -4,6 +4,7 @@
 #include "emulator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -160,6 +161,10 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     av::FramePacer pacer;
     pacer.configure(opt.targetFps, opt.vsync);
 
+    // Phase-5 raster tuning: band worker count (0 = auto). Must be set
+    // before the first draw so the pool forms with the requested size.
+    if (opt.gpuThreads != 0) gpu::Rasterizer::setBandThreads(opt.gpuThreads);
+
     // ---- 2. Load guest image ----------------------------------------------
     std::vector<ImportFn> resolvers{&resolveImports};
     ElfLoader loader(mem, resolvers);
@@ -235,8 +240,16 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     device->setAddressSpace(&mem.guest());   // GPU-VA draws (PBFF v1.1)
     device->setFrameClock(&pacer, &audio::Mixer::get());
     device->setPresenter(presenter);
+    // Phase-5 submit path: pipelined by default (--gpu-sync restores the
+    // inline path). Direct Device users (unit tests) stay synchronous.
+    device->setPipelined(!opt.gpuSync);
+    // Hardware backends skip the per-frame readback when nothing consumes
+    // the host color buffer (no screenshots, offscreen presentation).
+    device->setReadbackHint(!opt.screenshotDir.empty() ||
+                            presenter != static_cast<av::IPresenter*>(&offscreenPresenter));
     gpu::setActiveDevice(device.get());
 
+    std::atomic<u32> screenshotsTaken{0};   // hook runs on the GPU worker now
     if (!opt.screenshotDir.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(opt.screenshotDir, ec);
@@ -251,7 +264,7 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
             std::snprintf(path, sizeof(path), "%s/frame_%04llu.png",
                           opt.screenshotDir.c_str(),
                           static_cast<unsigned long long>(frame));
-            if (gpu::writePng(path, img)) stats.screenshots++;
+            if (gpu::writePng(path, img)) ++screenshotsTaken;
             else LOG_WARN("Emulator: screenshot write failed: %s", path);
         });
     }
@@ -268,7 +281,11 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     LOG_INFO("Emulator: entering guest (%s)", elfPath.c_str());
     GuestRunResult run = cpu::runGuestEntry(mod, kernel::KernelState::get());
     gpu::setActiveDevice(nullptr);
+    // Phase-5: drain + join the GPU queue workers BEFORE reading stats —
+    // the last submitted frames may still be in flight when the guest exits.
+    device->shutdownQueues();
     const u64 framesRendered = device ? device->frameCount() : 0;
+    const gpu::Device::QueueStats qs = device->queueStats();
     device.reset(); // destroy backend before the memory arena goes away
 
     // ---- 5. Teardown + stats -----------------------------------------------
@@ -310,6 +327,21 @@ EmuStats Emulator::run(const std::string& elfPath, const EmuOptions& opt) {
     stats.frameMaxIntervalMs = pacerStats.maxIntervalMs;
     stats.vsyncWaits = pacerStats.vsyncWaits;
     stats.netStubCalls = netStats.calls;
+
+    // Phase-5 GPU queue / raster accounting (queues drained before this).
+    stats.screenshots = screenshotsTaken.load();
+    stats.gpuPipelined = qs.pipelined;
+    stats.gpuEnqueued = qs.gfx.enqueued;
+    stats.gpuCompleted = qs.gfx.completed;
+    stats.gpuBackpressureWaits = qs.gfx.backpressureWaits;
+    stats.gpuMaxInFlight = qs.gfx.maxInFlight;
+    stats.gpuMaxInFlightCap = gpu::GpuQueue::kDefaultMaxInFlight;
+    stats.gpuExecuteUs = qs.gfx.executeUs;
+    stats.gpuComputeSubmits = qs.compute.enqueued;
+    stats.rasterThreads = gpu::Rasterizer::bandThreads();
+    stats.rasterSimd = gpu::Rasterizer::simdEnabled() &&
+                       gpu::Rasterizer::simdCompiled() &&
+                       gpu::Rasterizer::hostHasAvx2();
 
     if (stats.crashed) {
         LOG_ERROR("Emulator: guest crashed — see crash report");

@@ -29,7 +29,7 @@ jobs:
         working-directory: build
         run: ./psbet gpu
 
-      - name: Unit + integration tests (incl. Phase-3 guest suite)
+      - name: Unit + integration tests (incl. Phase-3/5 guest suite)
         working-directory: build
         run: ./psbet_tests
 
@@ -37,7 +37,10 @@ jobs:
         working-directory: build
         run: ./psbet_rdna_tests
 
-      - name: Fuzzed guest corpus (kernel API + PBFF, deterministic)
+      - name: Windows thunk arity audit (ABI ground truth)
+        run: python3 ci/audit_thunks.py
+
+      - name: Fuzzed guest corpus (kernel API + PBFF + concurrent submits)
         working-directory: build
         run: ./psbet_fuzz 64
 
@@ -90,6 +93,24 @@ jobs:
           ./psbet run input_demo.elf --fps 60 --pad-script pad.txt
           ./psbet run net_probe.elf
 
+      # Phase 5: async compute queue (fill + cross-queue fence) and
+      # multithreaded command submission (4 guest threads, pipelined queue).
+      - name: Phase-5 live demo — compute queue, concurrent submitters
+        working-directory: build
+        run: |
+          ./psbet run compute_fill.elf
+          ./psbet run mt_submit.elf
+
+      # Phase 5: performance regression tracking (per-commit budgets).
+      # Floors live in ci/perf_budgets.json (policy in ci/perf_gate.py:
+      # shared runners tolerate variance; the strict 2% rule is the
+      # same-machine A/B procedure documented in PHASE_5_REPORT §7).
+      - name: Phase-5 perf suite + regression gate
+        working-directory: build
+        run: |
+          ./psbet bench --frames 240 --json perf.json
+          python3 ../ci/perf_gate.py perf.json
+
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
@@ -107,6 +128,14 @@ jobs:
             build/audio_tone.elf
             build/input_demo.elf
             build/net_probe.elf
+            build/compute_fill.elf
+            build/mt_submit.elf
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbet-perf-report
+          path: build/perf.json
 
       - name: Upload Vulkan demo screenshots
         uses: actions/upload-artifact@v4
@@ -141,6 +170,8 @@ jobs:
             build/audio_tone.elf
             build/input_demo.elf
             build/net_probe.elf
+            build/compute_fill.elf
+            build/mt_submit.elf
 
   linux-asan:
     name: Linux ASan/UBSan
@@ -248,6 +279,25 @@ jobs:
         timeout-minutes: 5
         run: |
           Release\psbet.exe run ..\guests\audio_tone.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Phase 5: the new GPU surfaces ship with MASM thunks (arity 3 + 1);
+      # these runs exercise the compute-queue and pipelined-submit paths
+      # through the full SysV->Win64 bridge on Windows.
+      - name: Run compute_fill.elf on Windows (Phase-5 surface — hard gate)
+        working-directory: build
+        timeout-minutes: 5
+        run: |
+          Release\psbet.exe run ..\guests\compute_fill.elf
+          echo "exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run mt_submit.elf on Windows (Phase-5 surface — hard gate)
+        working-directory: build
+        timeout-minutes: 5
+        run: |
+          Release\psbet.exe run ..\guests\mt_submit.elf
           echo "exit: $LASTEXITCODE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

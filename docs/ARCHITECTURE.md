@@ -494,3 +494,83 @@ exposed to the run summary.
 | RDNA recompiler vs real captures | Unchanged (Phase 4+ per RDNA_SUBSET.md) |
 | Net-dependent guests | Deterministic refusal + logging; guests can gate on link state |
 | Commercial-title long tail | Unchanged (Phase 6 program) |
+
+## 13. Phase 5 addendum — performance engineering
+
+### 13.1 Pipelined GPU submit (the queue architecture)
+
+Phase 1-4 executed every guest submit inline on the guest thread: build CB
+-> parse -> draw -> present -> pace, all inside `sceGnmSubmitCommandBuffers`.
+Phase 5 splits that along the console's own seam. The `Device` owns two
+`GpuQueue` instances (graphics, compute), each a FIFO with a dedicated
+worker thread, a bounded snapshot arena, and an in-flight cap of 2:
+
+```
+guest thread                         GPU worker (graphics)
+-----------                          ----------------------
+build CB #N  ---- submit ----------> [snapshot N]
+build CB #N+1 <---- returns          execute N (parse + draw + present)
+build CB #N+2 ...                    execute N+1
+   (blocked at 2 in flight)          ...
+```
+
+Determinism: the queue is FIFO and single-worker, so a submit's state
+changes (viewport, depth, cull) can never interleave with another submit's
+draws — output is identical to the synchronous path for any timing. The
+in-flight cap doubles as the work-ahead bound and the natural backpressure:
+the guest may be at most 2 frames ahead of the GPU, and a submit blocked on
+the cap wakes on process exit or the frame limit (no teardown hangs).
+
+Console hazard model preserved: the device reads GPU-visible memory at
+execution time, so guests that mutate submitted data must multi-buffer
+(cube_vm now triple-buffers its vertex slots — 3 >= cap 2 + 1) or fence via
+`sceGnmWaitQueueIdle`. This is the documented console contract, not an
+emulator invention.
+
+`--gpu-sync` restores inline execution; unit tests default to synchronous
+and opt into pipelined mode explicitly, and the whole 37-test suite runs
+green in both modes.
+
+### 13.2 Async compute queue
+
+The compute queue is a second worker with the same mechanics. The Phase-5
+compute surface is `CmdFillMemory` (PBFF v1.4, op 7): a data-parallel fill
+of a GPU-VA region — the canonical first compute dispatch. Cross-queue
+ordering is explicit (`sceGnmWaitQueueIdle(PSB_QUEUE_COMPUTE)`); the
+`compute_fill` homebrew proves fill -> fence -> verify -> graphics-consume
+end to end, and `mt_submit` proves four guest threads can submit
+concurrently with exact frame accounting (fuzz Phase-G hammers it).
+
+### 13.3 Band-parallel software rasterizer + AVX2
+
+The reference rasterizer hoists per-triangle setup (NDC->screen, edge
+deltas, bbox) and splits each large triangle's bounding box into disjoint
+row bands executed on a persistent worker pool (default: min(hw-1, 8),
+`PSBET_RASTER_THREADS` override). Bands own disjoint pixels, so output is
+byte-identical for any thread count. An optional AVX2 path evaluates four
+pixels per vector with the exact same IEEE double operations (explicit
+intrinsics, no FMA contraction, scalar tail) — byte-identical to the scalar
+path, locked by `raster_parallel` / `avx2_compare` tests. Dispatch:
+`PSBET_RASTER_SIMD=off` forces scalar for A/B measurement.
+
+Measured on the 2-vCPU Phase-5 build host (4K cube, 300 frames, worker
+execution time): scalar/1 thread 9.7 ms/frame; AVX/1 thread 5.9 ms (1.64x);
+AVX/2 threads 3.9 ms (2.5x total). 4K output of the demo suite runs at
+~170-256 FPS on this 2-vCPU container — already past the >= 120 FPS
+acceptance before any dedicated reference hardware.
+
+### 13.4 Host-side tuning + lazy readback
+
+The Vulkan backend skips its per-frame readback copy when the host color
+buffer is not consumed (no screenshots, offscreen present) — a full
+framebuffer copy saved per submit. Tuning knobs: `--gpu-sync`,
+`--gpu-threads N`, `PSBET_RASTER_THREADS`, `PSBET_RASTER_SIMD`.
+
+### 13.5 Performance regression tracking
+
+`psbet bench` (software 720p, software 4K, software GPU-VA 720p, advisory
+Vulkan case) emits a JSON report; `ci/perf_gate.py` enforces
+`ci/perf_budgets.json` floors per commit and publishes the report as an
+artifact. Policy: shared-runner floors catch >>10% regressions; the strict
+2% rule is the same-machine A/B procedure (bench before/after, diff). The
+report documents the measured baseline and the tightening procedure.

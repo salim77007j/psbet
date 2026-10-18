@@ -4,16 +4,14 @@
 software (x86-64 guest images with Orbis-style system interfaces) on standard
 PCs running Linux and Windows.
 
-> **Status: Phase 4 complete** — everything from Phases 1–3 plus: the
-> guest timing domain (monotonic + drift-free by construction, 24 h
-> simulated soak), **AudioOut** (guest-side mixing into a fixed 48 kHz
-> stereo master, WAV-dump + SDL3 backends, zero-drop invariant), **pad
-> input** (DualSense-style state + gyroscope; deterministic scripted
-> driver and SDL3 gamepads; measured 1.3 ms median end-to-end input latency
-> (contract < 25 ms at 60 FPS, independent of GPU speed)), **target-FPS authorization** with frame-clock audio
-> consumption, a vsync present-queue model, the presentation layer
-> (offscreen or SDL3 window), and logged, fully-stubbed network. See
-> `docs/PHASE_4_REPORT.md`.
+> **Status: Phase 5 complete** — everything from Phases 1–4 plus
+> **performance engineering**: pipelined GPU submission (graphics + async
+> compute queues with console data-ownership semantics, cross-queue
+> fences), multithreaded command recording/submission from guest threads,
+> a band-parallel software rasterizer with a byte-exact AVX2 path
+> (4K demo output measured at 170–256 FPS on a 2-vCPU host), parallel
+> buffer clears, Vulkan lazy readback, and per-commit performance budgets
+> in CI. See `docs/PHASE_5_REPORT.md`.
 
 ![Cube demo](docs/screenshots/cube_soak_frame_5400.png)
 
@@ -45,7 +43,8 @@ behavior is reimplemented, cleanly, from public documentation:
 | Timing        | Monotonic drift-free domain, counter API, paced frame clock      | ✅ Working (Phase 4) |
 | Presentation  | Offscreen (CI) or SDL3 window                                    | ✅ Working (Phase 4) |
 | Network       | Stubbed with logging — no connectivity, by design                | ✅ Working (Phase 4) |
-| Performance   | Pipelining, 4K/120 target, perf CI gate                          | 🔜 Phase 5           |
+| Performance   | Pipelined submit + compute queues, band-parallel + AVX2 raster   | ✅ Working (Phase 5) |
+| Perf budgets  | `psbet bench` + CI gate per commit                               | ✅ Working (Phase 5) |
 
 ## GPU backends
 

@@ -29,6 +29,8 @@ enum class CmdOp : u32 {
     DrawTriangles     = 5,
     // ---- v1.1: GPU virtual address draws ---------------------------------
     DrawTrianglesGpu  = 6,   // vertices fetched via the GPU page tables
+    // ---- v1.4: compute-queue data-parallel work ---------------------------
+    FillMemory        = 7,   // fill a GPU-VA region with a u32 pattern
 };
 
 enum class DepthFunc : u32 { Never = 0, Less = 1, Equal = 2, LEqual = 3 };
@@ -78,6 +80,17 @@ struct CmdDrawTrianglesGpu {
     u32 vertexCount = 0;
     u32 reserved = 0;
     u64 gpuVa = 0;      // byte address in the GPU VA space
+};
+
+// v1.4: compute-queue fill (the canonical first compute dispatch — a
+// data-parallel clear of GPU-visible memory). Executed on the compute queue;
+// guests order dependent graphics work with sceGnmWaitQueueIdle.
+struct CmdFillMemory {
+    CmdHeader hdr{CmdOp::FillMemory, sizeof(CmdFillMemory)};
+    u64 gpuVa = 0;      // byte address in the GPU VA space (4-byte aligned)
+    u64 byteLen = 0;    // fill length in bytes (multiple of 4, <= 64 MiB)
+    u32 pattern = 0;    // u32 fill pattern
+    u32 reserved = 0;
 };
 
 #pragma pack(pop)

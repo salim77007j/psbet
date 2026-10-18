@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <thread>
 #include <vector>
 #include <filesystem>
@@ -278,6 +279,66 @@ bool runPbffSeed(u64 seed) {
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Fuzzer 3 (Phase G): concurrent submitters hammering the pipelined queue.
+// Four threads submit random VALID command buffers concurrently; the queue
+// serializes execution, so the invariants are: no crashes/sanitizer errors,
+// and exact frame accounting (completed == enqueued after the drain).
+// Output pixels are NOT compared (interleaving is legitimately unordered).
+// ---------------------------------------------------------------------------
+bool runConcurrentSeed(u64 seed) {
+    Rng rng(seed ^ 0x9E3779B97F4A7C15ull);
+    const u32 W = 64, H = 64;
+    std::vector<u8> color(W * H * 4);
+    std::vector<float> depth(W * H, 1.0f);
+
+    psb::gpu::Device dev(color.data(), depth.data(), W, H);
+    dev.setPipelined(true);
+    psb::gpu::setActiveDevice(&dev);
+
+    constexpr u32 kThreads = 4;
+    constexpr u32 kPerThread = 8;
+    std::atomic<u64> submitted{0};
+
+    auto worker = [&](u32 id) {
+        Rng r(seed + 1000 + id);
+        for (u32 i = 0; i < kPerThread; ++i) {
+            psb::gpu::CmdWriter cw;
+            psb::gpu::CmdClear c;
+            c.color[0] = (r.next() % 256) / 255.0f;
+            c.color[1] = (r.next() % 256) / 255.0f;
+            cw.push(c);
+            psb::gpu::CmdSetViewport v;
+            v.w = (float)W; v.h = (float)H;
+            cw.push(v);
+            psb::gpu::GpuVertex tri[3];
+            for (auto& vt : tri) {
+                for (float& f : vt.pos) f = ((i64)(r.next() % 2001) - 1000) / 500.0f;
+                vt.pos[3] = 1.f;
+                for (float& f : vt.col) f = (r.next() % 256) / 255.0f;
+            }
+            cw.draw(tri, 3);
+            void* addr = const_cast<void*>(cw.data());
+            u32 size = cw.size();
+            if (psb::gpu::sceGnmSubmitCommandBuffers(1, &addr, &size, 0, 0, 0) == 0)
+                submitted.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> th;
+    for (u32 i = 0; i < kThreads; ++i) th.emplace_back(worker, i);
+    for (auto& t : th) t.join();
+
+    psb::gpu::setActiveDevice(nullptr);
+    dev.shutdownQueues();
+
+    const psb::gpu::Device::QueueStats qs = dev.queueStats();
+    if (qs.gfx.enqueued != submitted.load()) return false;
+    if (qs.gfx.completed != qs.gfx.enqueued) return false;
+    if (dev.frameCount() != submitted.load()) return false;
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -304,6 +365,12 @@ int main(int argc, char** argv) {
         }
         if (!runPbffSeed(s)) {
             std::printf("  [FUZZ] pbff seed %llu FAIL\n",
+                        static_cast<unsigned long long>(s));
+            ++failed;
+        }
+        // Phase G: concurrent submitters against the pipelined queue.
+        if (!runConcurrentSeed(s)) {
+            std::printf("  [FUZZ] concurrent seed %llu FAIL\n",
                         static_cast<unsigned long long>(s));
             ++failed;
         }

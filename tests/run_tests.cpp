@@ -681,7 +681,9 @@ bool test_guest_cube() {
     opt.screenshotInterval = 15;
     const psb::EmuStats st = emu.run("cube.elf", opt);
     CHECK(st.guestExitCode == 124);       // frame limit exit
-    CHECK(st.frames == 45);
+    // Phase-5 pipelined contract: the guest is up to kMaxInFlight (2) frames
+    // ahead when the limit fires, so the final count lands in a small window.
+    CHECK(st.frames >= 45 && st.frames <= 47);
     CHECK(st.screenshots == 3);           // frames 15, 30, 45
     CHECK(!st.crashed);
     CHECK(st.threadsDetached == 0);       // Phase-3: clean teardown
@@ -1058,7 +1060,7 @@ bool test_guest_cube_vm() {
     opt.screenshotInterval = 30;
     const psb::EmuStats st = emu.run("cube_vm.elf", opt);
     CHECK(st.guestExitCode == 124);
-    CHECK(st.frames == 30);
+    CHECK(st.frames >= 30 && st.frames <= 32);   // pipelined work-ahead window
     CHECK(st.screenshots == 1);
     CHECK(!st.crashed);
     CHECK(st.threadsDetached == 0);
@@ -1219,7 +1221,7 @@ bool test_guest_paced_cube() {
     opt.targetFps = 60;
     const psb::EmuStats st = emu.run("cube.elf", opt);
     CHECK(st.guestExitCode == 124);
-    CHECK(st.frames == 60);
+    CHECK(st.frames >= 60 && st.frames <= 62);   // pipelined work-ahead window
     CHECK(st.frameMeanIntervalMs > 14.0);    // paced, not free-run
     CHECK(st.frameMeanIntervalMs < 20.0);
     CHECK(st.frameMaxIntervalMs < 100.0);    // no stall outliers
@@ -1229,6 +1231,267 @@ bool test_guest_paced_cube() {
 #endif
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Phase-5: performance engineering. Queue semantics, band-parallel and AVX
+// rasterizer identity (byte-exact), pipelined device submits, and the new
+// guest surfaces (compute queue, multithreaded submitters).
+// ---------------------------------------------------------------------------
+
+bool test_gpu_queue() {
+    using psb::gpu::GpuQueue;
+    struct Ctx {
+        std::vector<int> order;
+        std::vector<std::vector<psb::u8>> payloads;
+    } ctx;
+
+    static auto exec = [](void* user, const void* data, psb::u32 size,
+                          bool last) -> bool {
+        (void)last;
+        Ctx* c = static_cast<Ctx*>(user);
+        const int* v = static_cast<const int*>(data);
+        c->order.push_back(*v);
+        std::vector<psb::u8> p(static_cast<size_t>(size));
+        std::memcpy(p.data(), data, size);
+        c->payloads.push_back(std::move(p));
+        return true;
+    };
+
+    Ctx ctx2;
+    {
+        GpuQueue q("test", exec, &ctx2);
+        // FIFO order preservation.
+        for (int i = 0; i < 16; ++i) {
+            const psb::u32 sz = static_cast<psb::u32>(sizeof(int));
+            CHECK(q.submit(&i, sz, true) == 0);
+        }
+        q.shutdown();
+        CHECK(ctx2.order.size() == 16);
+        for (int i = 0; i < 16; ++i) CHECK(ctx2.order[static_cast<size_t>(i)] == i);
+
+        // Snapshot semantics: data is copied at submit time.
+        int x = 100;
+        CHECK(q.submit(&x, sizeof(int), true) == -1);   // shutdown -> reject
+    }
+    {
+        // Rejection of oversized buffers.
+        GpuQueue q("test2", exec, &ctx2);
+        static psb::u8 big[GpuQueue::kMaxCbBytes + 1];
+        std::memset(big, 0, sizeof(big));
+        CHECK(q.submit(big, sizeof(big), true) == -1);
+        q.shutdown();
+        CHECK(ctx2.order.size() == 16);   // unchanged
+    }
+
+    GpuQueue q("test3", exec, &ctx2);
+    int i = 7;
+    CHECK(q.submit(&i, sizeof(int), true) == 0);
+    q.shutdown();
+    const GpuQueue::Stats s = q.stats();
+    CHECK(s.enqueued == 1);
+    CHECK(s.completed == 1);
+    CHECK(s.maxInFlight == 1);
+    CHECK(s.snapshotBytes == sizeof(int));
+    CHECK(s.inFlight == 0);
+    return true;
+}
+
+// Renders one deterministic scene into `color` with the given band/SIMD
+// configuration (saved + restored around the call).
+static void renderScene(psb::u32 W, psb::u32 H, psb::u32 bands, bool simd,
+                        psb::u8* color, float* depth) {
+    const psb::u32 savedBands = psb::gpu::Rasterizer::bandThreads();
+    const bool savedSimd = psb::gpu::Rasterizer::simdEnabled();
+    psb::gpu::Rasterizer::setBandThreads(bands);
+    psb::gpu::Rasterizer::setSimdEnabled(simd);
+
+    std::fill(color, color + W * H * 4, 0);
+    std::fill(depth, depth + W * H, 1.0f);
+    psb::gpu::Rasterizer ras(color, depth, W, H);
+    ras.setViewport(0, 0, static_cast<float>(W), static_cast<float>(H));
+    ras.setDepthTest(true, psb::gpu::DepthFunc::Less);
+    ras.setCullMode(psb::gpu::CullMode::None);
+    ras.clear(0.05f, 0.07f, 0.12f, 1.f);
+
+    // A rotating-cube-like scene: large + small triangles, overlapping with
+    // depth interactions, partial offscreen coverage.
+    std::vector<psb::gpu::GpuVertex> verts;
+    for (int f = 0; f < 6; ++f) {
+        const float a = f * 0.55f;
+        const float cx = -0.45f + 0.28f * f;   // spread across the screen
+        const float cy = (f % 2) ? 0.35f : -0.35f;
+        const float z = 0.2f + 0.1f * (f % 3);
+        const float s = 0.30f + 0.05f * f;
+        const float col[4] = {0.9f - 0.1f * f / 6, 0.3f + 0.1f * f,
+                              0.4f + 0.08f * f, 1.f};
+        const float dx = s * std::cos(a), dy = s * std::sin(a);
+        const psb::gpu::GpuVertex tri[3] = {
+            {{cx - dx, cy - dy, z, 1.f}, {col[0], col[1], col[2], 1.f}},
+            {{cx + dx * 2, cy + dy, z - 0.05f, 1.f}, {col[0], col[1], col[2], 1.f}},
+            {{cx - dy, cy + dx, z + 0.05f, 1.f}, {col[0], col[1], col[2], 1.f}},
+        };
+        verts.insert(verts.end(), tri, tri + 3);
+    }
+    // A fan of tiny triangles (exercises the small-triangle inline path).
+    for (int i = 0; i < 64; ++i) {
+        const float ang = i * 3.14159f / 32.f;
+        const psb::gpu::GpuVertex tri[3] = {
+            {{0.5f * std::cos(ang), 0.5f * std::sin(ang), 0.9f, 1.f},
+             {1.f, 1.f, 0.f, 1.f}},
+            {{0.5f * std::cos(ang + 0.02f), 0.5f * std::sin(ang + 0.02f), 0.8f, 1.f},
+             {0.f, 1.f, 1.f, 1.f}},
+            {{0.0f, 0.0f, 0.7f, 1.f}, {1.f, 0.f, 1.f, 1.f}},
+        };
+        verts.insert(verts.end(), tri, tri + 3);
+    }
+    ras.drawTriangles(verts.data(), static_cast<psb::u32>(verts.size()));
+
+    psb::gpu::Rasterizer::setBandThreads(savedBands);
+    psb::gpu::Rasterizer::setSimdEnabled(savedSimd);
+}
+
+bool test_raster_parallel() {
+    // Byte-exact identity: 1 serial band vs 8 bands vs 3 bands, all scalar.
+    const psb::u32 W = 320, H = 180;
+    std::vector<psb::u8> ref(W * H * 4), out(W * H * 4);
+    std::vector<float> dref(W * H), dout(W * H);
+
+    renderScene(W, H, 1, false, ref.data(), dref.data());
+    renderScene(W, H, 8, false, out.data(), dout.data());
+    CHECK(std::memcmp(ref.data(), out.data(), ref.size()) == 0);
+    CHECK(std::memcmp(dref.data(), dout.data(), dref.size() * sizeof(float)) == 0);
+
+    renderScene(W, H, 3, false, out.data(), dout.data());
+    CHECK(std::memcmp(ref.data(), out.data(), ref.size()) == 0);
+
+    // SIMD + bands together (on AVX2 hosts the real fast path runs).
+    renderScene(W, H, 8, true, out.data(), dout.data());
+    CHECK(std::memcmp(ref.data(), out.data(), ref.size()) == 0);
+    return true;
+}
+
+bool test_avx2_compare() {
+    if (!psb::gpu::Rasterizer::simdCompiled()) {
+        std::printf("    (skip — no AVX path compiled, e.g. MSVC)\n");
+        return true;
+    }
+    if (!psb::gpu::Rasterizer::hostHasAvx2()) {
+        std::printf("    (skip — host CPU lacks AVX2)\n");
+        return true;
+    }
+    const psb::u32 W = 320, H = 180;
+    std::vector<psb::u8> scalar(W * H * 4), avx(W * H * 4);
+    std::vector<float> ds(W * H), da(W * H);
+    renderScene(W, H, 1, false, scalar.data(), ds.data());
+    renderScene(W, H, 1, true, avx.data(), da.data());
+    CHECK(std::memcmp(scalar.data(), avx.data(), scalar.size()) == 0);
+    CHECK(std::memcmp(ds.data(), da.data(), ds.size() * sizeof(float)) == 0);
+    return true;
+}
+
+bool test_device_pipelined() {
+    // Device-level queue semantics through the real guest submit shims.
+    const psb::u32 W = 96, H = 96;
+    std::vector<psb::u8> color(W * H * 4, 0);
+    std::vector<float> depth(W * H, 1.0f);
+    psb::gpu::Device dev(color.data(), depth.data(), W, H);
+    dev.setPipelined(true);
+    psb::gpu::setActiveDevice(&dev);
+
+    // 5 valid frames: clear only.
+    for (int f = 0; f < 5; ++f) {
+        psb::gpu::CmdClear clear;
+        clear.color[0] = 0.1f * (f + 1);
+        void* addr = &clear;
+        psb::u32 size = sizeof(clear);
+        CHECK(psb::gpu::sceGnmSubmitCommandBuffers(1, &addr, &size, 0, 0, 0) == 0);
+    }
+    dev.gfxQ_.waitIdle();
+    CHECK(dev.frameCount() == 5);
+    const psb::u8* px = color.data();
+    // Last clear color: 0.5f in red only -> 0.5 * 255.99 truncated = 127.
+    CHECK(px[0] == 127 && px[1] == 0 && px[2] == 0);
+
+    // Malformed buffer: rejected at submit time (return -1), nothing queued.
+    static const psb::u32 garbage[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    void* badAddr = const_cast<psb::u32*>(garbage);
+    psb::u32 badSize = sizeof(garbage);
+    CHECK(psb::gpu::sceGnmSubmitCommandBuffers(1, &badAddr, &badSize, 0, 0, 0) == -1);
+    dev.gfxQ_.waitIdle();
+    CHECK(dev.frameCount() == 5);
+
+    // Compute-queue fill: packet fills a host-visible buffer via GPU-VA.
+    // (Uses the guest VM for translation; the backing store must be a real
+    // direct-memory allocation — the only pages the GPU VM accepts.)
+    psb::MemoryManager mem;
+    CHECK(mem.init());
+    dev.setAddressSpace(&mem.guest());
+    psb::u64 va = mem.guest().gpuReserve(4096, 4096, 0);
+    CHECK(va != 0);
+    // pool 1 = GPU-visible direct memory (the cube_vm convention). Map it
+    // for CPU access FIRST (mapDirect commits the host pages; allocDirect
+    // only carves the physical free list).
+    const psb::u64 pa = mem.guest().allocDirect(1, 4096, 4096, 0, 0, "cfill");
+    CHECK(pa != 0);
+    const psb::u64 cpuVa = mem.guest().mapDirect(pa, 4096, psb::vm::Prot::ReadWrite,
+                                                 "cfill");
+    CHECK(cpuVa != 0);
+    CHECK(mem.guest().gpuMap(va, pa, 4096, psb::vm::Prot::ReadWrite));
+
+    psb::u32* host = reinterpret_cast<psb::u32*>(cpuVa);
+    CHECK(host != nullptr);
+    for (int i = 0; i < 1024; ++i) host[i] = 0xDEADBEEFu;
+
+    psb::gpu::CmdFillMemory fill;
+    fill.gpuVa = va;
+    fill.byteLen = 4096;
+    fill.pattern = 0x12345678u;
+    void* cAddr = &fill;
+    psb::u32 cSize = sizeof(fill);
+    CHECK(psb::gpu::sceGnmSubmitCompute(1, &cAddr, &cSize) == 0);
+    CHECK(psb::gpu::sceGnmWaitQueueIdle(PSB_QUEUE_COMPUTE) == 0);
+    bool filled = true;
+    for (int i = 0; i < 1024; ++i) filled = filled && host[i] == 0x12345678u;
+    CHECK(filled);
+    // Compute submits are not frames.
+    CHECK(dev.frameCount() == 5);
+
+    // Bad mask rejected.
+    CHECK(psb::gpu::sceGnmWaitQueueIdle(0) == -1);
+    CHECK(psb::gpu::sceGnmWaitQueueIdle(5) == -1);
+
+    psb::gpu::setActiveDevice(nullptr);
+    dev.shutdownQueues();
+    return true;
+}
+
+bool test_guest_compute_fill() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.width = 320; opt.height = 180;
+    const psb::EmuStats st = emu.run("compute_fill.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    CHECK(st.gpuPipelined);
+    CHECK(st.gpuComputeSubmits == 1);   // one compute CB (the fill)
+    CHECK(st.gpuEnqueued == 1);         // one graphics CB (the display frame)
+    CHECK(st.gpuCompleted == 1);
+    return true;
+}
+
+bool test_guest_mt_submit() {
+    psb::Emulator emu;
+    psb::EmuOptions opt;
+    opt.width = 320; opt.height = 180;
+    const psb::EmuStats st = emu.run("mt_submit.elf", opt);
+    CHECK(st.guestExitCode == 0);
+    CHECK(!st.crashed);
+    // 4 workers x 10 submits — every CB completes before the guest's fence.
+    CHECK(st.frames == 40);
+    CHECK(st.gpuCompleted == 40);
+    CHECK(st.threadsDetached == 0);   // clean teardown (Phase-3 invariant)
+    return true;
+}
 
 int main() {
     psb::log::setLevel(psb::log::Level::Warn);
@@ -1249,6 +1512,10 @@ int main() {
     runTest("audio_wav_file",            test_audio_wav_file);
     runTest("pad_unit (scripted driver)", test_pad_unit);
     runTest("net_stubs (documented refusals)", test_net_stubs);
+    runTest("gpu_queue (FIFO/snapshot/stats)", test_gpu_queue);
+    runTest("raster_parallel (byte-exact bands)", test_raster_parallel);
+    runTest("avx2_compare (byte-exact SIMD)", test_avx2_compare);
+    runTest("device_pipelined (async submits)", test_device_pipelined);
 #ifdef PSBET_RUN_GUEST_TESTS
     runTest("guest_hello (threads/TLS/sync)", test_guest_hello);
     runTest("guest_worker_exit (flaw-1 regression)", test_guest_worker_exit);
@@ -1263,6 +1530,8 @@ int main() {
     runTest("guest_audio_paced (latency<40ms)", test_guest_audio_paced);
     runTest("guest_input_latency (<25ms@60)", test_guest_input_latency);
     runTest("guest_paced_cube (60 FPS auth)", test_guest_paced_cube);
+    runTest("guest_compute_fill (compute queue)", test_guest_compute_fill);
+    runTest("guest_mt_submit (concurrent submitters)", test_guest_mt_submit);
     runTest("loader_et_exec (absolute vaddrs)", test_loader_et_exec_static);
     runTest("loader_dyn_offset (non-zero lo)",  test_loader_dyn_offset_static);
     runTest("loader_irelative_relro",           test_loader_irelative_relro);

@@ -52,7 +52,7 @@ public:
     void setCullMode(CullMode mode) override;
     void clear(float r, float g, float b, float a) override;
     void drawTriangles(const GpuVertex* v, u32 count) override;
-    void frameEnd() override;
+    void frameEnd(bool readback) override;
 
 private:
     VulkanDevice() = default;

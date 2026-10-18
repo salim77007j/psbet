@@ -1,5 +1,5 @@
 // ============================================================================
-//  PSBET test homebrew — cube_vm.c (Phase 3)
+//  PSBET test homebrew — cube_vm.c (Phase 3, Phase-5 pipelining update)
 //  The Phase-1 cube, re-plumbed through the Phase-3 faithful memory model:
 //    * vertex data lives in typed direct memory (GPU-visible pool),
 //    * it is mapped into the GPU's own virtual address space
@@ -7,6 +7,13 @@
 //    * each frame the display command buffer carries only the GPU-VA
 //      (PBFF v1.1 DrawTrianglesGpu) — the device translates the address
 //      through its page tables per submit.
+//
+//  Phase 5: GPU submissions are ASYNCHRONOUS (console semantics) — the
+//  device reads GPU-VA memory at EXECUTION time, so the guest must not
+//  rewrite a vertex buffer the GPU may still be drawing. This guest
+//  TRIPLE-BUFFERS: 3 vertex slots, one per in-flight frame (queue cap is
+//  2); slot for frame F was last drawn at frame F-3 and is provably idle.
+//  This is the textbook console data-ownership pattern.
 //
 //  Exit code: runs until the host frame limit (124) or error (non-zero).
 // ============================================================================
@@ -92,27 +99,31 @@ static void project(const Mat4* rot, const float* p, float* out4) {
 
 void psb_entry(void) {
     static const uint32_t kVertCount = 36;
+    static const uint64_t kSlotBytes = 4096;             // one 4K page per slot
+    static const uint32_t kSlots = 3;                    // >= queue cap + 1
 
     // ---- 1. allocate the vertex buffer in the GPU-visible pool -------------
     int64_t pa = 0;
-    if (sceKernelAllocateDirectMemory(0, 0, 4096, 4096, 1 /*gpu-visible*/, &pa) != 0)
+    if (sceKernelAllocateDirectMemory(0, 0, kSlotBytes * kSlots, kSlotBytes,
+                                      1 /*gpu-visible*/, &pa) != 0)
         sceKernelExitProcess(1);
 
     // ---- 2. map it for CPU writes (identity) --------------------------------
     void* cpu = 0;
-    if (sceKernelMapDirectMemory(&cpu, 4096,
+    if (sceKernelMapDirectMemory(&cpu, kSlotBytes * kSlots,
                                  PSB_PROT_READ | PSB_PROT_WRITE, 0, pa, 0) != 0)
         sceKernelExitProcess(2);
 
     // ---- 3. map it into the GPU's virtual address space ----------------------
     uint64_t gpuVa = 0;
-    if (sceGnmReserveGpuAddress(4096, 4096, 0, &gpuVa) != 0)
+    if (sceGnmReserveGpuAddress(kSlotBytes * kSlots, kSlotBytes, 0, &gpuVa) != 0)
         sceKernelExitProcess(3);
-    if (sceGnmMapGpuAddress(gpuVa, pa, 4096, PSB_PROT_READ) != 0)
+    if (sceGnmMapGpuAddress(gpuVa, pa, kSlotBytes * kSlots, PSB_PROT_READ) != 0)
         sceKernelExitProcess(4);
 
     // ---- 4. render loop: guest CPU writes vertices, GPU reads them ----------
     const uint64_t t0 = sceKernelGetProcessTime();
+    uint64_t frame = 0;
     for (;;) {
         const uint64_t t = sceKernelGetProcessTime() - t0;
         const float angle = (float)(t % 4000000ull) * (6.28318f / 4000000.f) * 2.f;
@@ -120,7 +131,9 @@ void psb_entry(void) {
         Mat4 rot;
         mat_rotate(&rot, angle * 0.7f, angle);
 
-        float* verts = (float*)cpu;   // 36 * 8 floats
+        // Triple-buffered slot: frame F writes slot F % 3; the GPU can be
+        // executing at most the two previous frames (slots (F-1)%3, (F-2)%3).
+        float* verts = (float*)((uint8_t*)cpu + kSlotBytes * (frame % kSlots));
         size_t vi = 0;
         for (int f = 0; f < 6; ++f) {
             const int quad[4] = { cube_faces[f][0], cube_faces[f][1],
@@ -167,9 +180,11 @@ void psb_entry(void) {
             push_bytes(&off, &pkt, sizeof(pkt));
         }
         {
-            // op 6 = DrawTrianglesGpu: vertices fetched via the GPU page tables.
+            // op 6 = DrawTrianglesGpu: vertices fetched via the GPU page tables
+            // (this frame's triple-buffered slot).
             struct { uint32_t op, size, vertexCount, reserved; uint64_t gpuVa; } pkt = {
-                6, 24, kVertCount, 0, gpuVa};
+                6, 24, kVertCount, 0,
+                gpuVa + kSlotBytes * (frame % kSlots)};
             push_bytes(&off, &pkt, sizeof(pkt));
         }
 
@@ -177,5 +192,6 @@ void psb_entry(void) {
         uint32_t dcbSizes[1] = { (uint32_t)off };
         if (sceGnmSubmitCommandBuffers(1, dcbAddrs, dcbSizes, 0, 0, 0) != 0)
             sceKernelExitProcess(5);
+        ++frame;
     }
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Audit w64_thunks.asm thunk arities against the guest ABI (psb_guest_api.h).
 Ground truth = guest-side declarations."""
+import os
 import re
 
-root = "/home/z/my-project/psbet_repo"
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 asm = open(f"{root}/src/platform/w64_thunks.asm").read()
 hdr = open(f"{root}/include/psbet/psb_guest_api.h").read()
 
